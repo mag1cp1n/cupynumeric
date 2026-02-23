@@ -493,14 +493,14 @@ static CUDALibraries& get_cuda_libraries(legate::Processor proc)
 
 cublasContext* get_cublas()
 {
-  const auto proc = legate::Processor::get_executing_processor();
+  const auto proc = legate::Runtime::get_runtime()->get_executing_processor();
   auto& lib       = get_cuda_libraries(proc);
   return lib.get_cublas();
 }
 
 cusolverDnContext* get_cusolver()
 {
-  const auto proc = legate::Processor::get_executing_processor();
+  const auto proc = legate::Runtime::get_runtime()->get_executing_processor();
   auto& lib       = get_cuda_libraries(proc);
   return lib.get_cusolver();
 }
@@ -520,7 +520,7 @@ CuSolverExtraSymbols* get_cusolver_extra_symbols()
 #if LEGATE_DEFINED(CUPYNUMERIC_USE_CUSOLVERMP)
 cusolverMpHandle* get_cusolvermp(cudaStream_t stream, int nprow, int npcol)
 {
-  const auto proc = legate::Processor::get_executing_processor();
+  const auto proc = legate::Runtime::get_runtime()->get_executing_processor();
   auto& lib       = get_cuda_libraries(proc);
   return lib.get_cusolvermp(stream, nprow, npcol);
 }
@@ -528,28 +528,28 @@ cusolverMpHandle* get_cusolvermp(cudaStream_t stream, int nprow, int npcol)
 
 const cutensorHandle_t& get_cutensor()
 {
-  const auto proc = legate::Processor::get_executing_processor();
+  const auto proc = legate::Runtime::get_runtime()->get_executing_processor();
   auto& lib       = get_cuda_libraries(proc);
   return lib.get_cutensor();
 }
 
 cufftContext get_cufft_plan(cufftType type, const cufftPlanParams& params, cudaStream_t stream)
 {
-  const auto proc = legate::Processor::get_executing_processor();
+  const auto proc = legate::Runtime::get_runtime()->get_executing_processor();
   auto& lib       = get_cuda_libraries(proc);
   return lib.get_cufft_plan(type, params, stream);
 }
 
 const cudaDeviceProp& get_device_properties()
 {
-  const auto proc = legate::Processor::get_executing_processor();
+  const auto proc = legate::Runtime::get_runtime()->get_executing_processor();
   auto& lib       = get_cuda_libraries(proc);
   return lib.get_device_properties();
 }
 
 int get_device_ordinal()
 {
-  const auto proc = legate::Processor::get_executing_processor();
+  const auto proc = legate::Runtime::get_runtime()->get_executing_processor();
   auto& lib       = get_cuda_libraries(proc);
   return lib.get_device_ordinal();
 }
@@ -562,7 +562,7 @@ class LoadCUDALibsTask : public CuPyNumericTask<LoadCUDALibsTask> {
  public:
   static void gpu_variant(legate::TaskContext context)
   {
-    const auto proc = legate::Processor::get_executing_processor();
+    const auto proc = legate::Runtime::get_runtime()->get_executing_processor();
     auto& lib       = get_cuda_libraries(proc);
     lib.get_cublas();
     lib.get_cusolver();
@@ -582,7 +582,7 @@ class UnloadCUDALibsTask : public CuPyNumericTask<UnloadCUDALibsTask> {
  public:
   static void gpu_variant(legate::TaskContext context)
   {
-    const auto proc = legate::Processor::get_executing_processor();
+    const auto proc = legate::Runtime::get_runtime()->get_executing_processor();
     auto& lib       = get_cuda_libraries(proc);
     lib.finalize();
     auto* extra = get_cusolver_extra_symbols();
