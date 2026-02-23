@@ -32,7 +32,7 @@ openblas_version:
   - ">=0.3.0,<=0.3.23"
 
 cupy_version:
-  - ">=12.0,<13.7"
+  - ">=12.0,<14.1"
 
 cutensor_version:
   # cutensor 2.3 is required for CUDA 13
