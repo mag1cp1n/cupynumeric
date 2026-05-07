@@ -6,7 +6,7 @@
             "artifact_name": "${{ inputs.platform }}-${{ inputs.build-type }}-<<repo>>-python${{ inputs.python-version }}-${{ inputs.target-device }}-release-with_tests-${{ inputs.network }}-<<git_tag>>",
             "artifact_workflow": "ci-gh.yml",
             "git_shallow": false,
-            "git_tag": "1b923b7b9724ea40bd898cc2bf6f30b54253a2af",
+            "git_tag": "a955e2e4f6543bd7bb6304404f90d27a04fa679c",
             "git_url": "git@github.com:nv-legate/legate.internal.git",
             "nightly_workflow": "ci-gh-nightly-release.yml",
             "org": "nv-legate",
