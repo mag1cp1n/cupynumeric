@@ -67,6 +67,12 @@
             registryUrls: ["https://api.anaconda.org/package/conda-forge"],
         },
         {
+            description: "Limit conda upper bound updates to Mondays",
+            matchDatasources: ["conda"],
+            matchManagers: ["custom.regex"],
+            schedule: ["* 0-3 * * 1"],
+        },
+        {
             description: "Map underscored conda dep names to canonical package names",
             matchDatasources: ["conda"],
             matchManagers: ["custom.regex"],
@@ -162,4 +168,5 @@
     rebaseWhen: "auto",
     semanticCommits: "enabled",
     timezone: "UTC",
+    updateNotScheduled: false,
 }
