@@ -84,7 +84,12 @@ jobs:
       - name: Create unique directory on the slurm shared directory
         id: unique_dir
         run: |
-          UNIQUE_DIR="${SLURM_SHARED_DIR:?}/${GITHUB_JOB}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # Include python/cuda in the path: nested reusable-workflow jobs can share
+          # GITHUB_RUN_ID, so matrix legs (e.g. nightly Python versions) must not collide.
+          PY="${{ inputs.python-version }}"
+          CUDA="${{ inputs.cuda-version }}"
+          MATRIX_SLUG="py_${PY}__cuda_${CUDA:-none}"
+          UNIQUE_DIR="${SLURM_SHARED_DIR:?}/${GITHUB_JOB}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${MATRIX_SLUG}"
           mkdir -p "${UNIQUE_DIR}"
           echo "path=${UNIQUE_DIR}" | tee -a "${GITHUB_OUTPUT}"
 
@@ -106,7 +111,7 @@ jobs:
         run: |
           PY="${{ inputs.python-version }}"
           CUDA="${{ inputs.cuda-version }}"
-          MATRIX_SLUG="py_${PY}__cuda_${CUDA}"
+          MATRIX_SLUG="py_${PY}__cuda_${CUDA:-none}"
           ARTIFACTS_SHARED="${{ steps.unique_dir.outputs.path }}/matrix/${MATRIX_SLUG}"
           mkdir -p "${ARTIFACTS_SHARED}"
           # cp and then rm to avoid "Device or resource busy"
