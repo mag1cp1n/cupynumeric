@@ -673,6 +673,21 @@ std::optional<std::size_t> CuPyNumericMapper::allocation_pool_size(
                    aligned_size(task.num_inputs() * sizeof(const int64_t*), DEFAULT_ALIGNMENT)
                : 0;
     }
+    case CUPYNUMERIC_ZIPGATHER: {
+      // Two scratch buffers:
+      //  - FBMEM: AccessorRO table for the sparse / general path, copied H2D
+      //    before the kernel launch.
+      //  - ZCMEM: const int64_t* pointer table for the dense path, written
+      //    directly by the host and read once on the device.
+      const auto num_index_arrays = task.num_inputs() - 1;
+      if (memory_kind == legate::mapping::StoreTarget::FBMEM) {
+        return aligned_size(num_index_arrays * sizeof(ACC_TYPE), DEFAULT_ALIGNMENT);
+      }
+      if (memory_kind == legate::mapping::StoreTarget::ZCMEM) {
+        return aligned_size(num_index_arrays * sizeof(const int64_t*), DEFAULT_ALIGNMENT);
+      }
+      return 0;
+    }
     case CUPYNUMERIC_IN1D: {
       if (memory_kind == legate::mapping::StoreTarget::ZCMEM) {
         return 0;

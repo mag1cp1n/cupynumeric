@@ -1,4 +1,4 @@
-/* Copyright 2024 NVIDIA Corporation
+/* Copyright 2024-2026 NVIDIA Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -93,69 +93,12 @@ __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
   out[p] = new_point;
 }
 
-template <typename Output, int DIM>
-__global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
-  check_kernel(Output out,
-               const Buffer<AccessorRO<int64_t, DIM>, 1> index_arrays,
-               const int64_t volume,
-               const int64_t iters,
-               const Rect<DIM> rect,
-               const Pitches<DIM - 1> pitches,
-               const int64_t narrays,
-               const int64_t start_index,
-               const DomainPoint shape)
-{
-  bool value = false;
-  for (size_t i = 0; i < iters; i++) {
-    const auto idx = (i * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= volume) {
-      break;
-    }
-    auto p = pitches.unflatten(idx, rect.lo);
-    for (size_t n = 0; n < narrays; n++) {
-      const int64_t extent = shape[start_index + n];
-      coord_t index = index_arrays[n][p] < 0 ? index_arrays[n][p] + extent : index_arrays[n][p];
-      bool val      = (index < 0 || index >= extent);
-      SumReduction<bool>::fold<true>(value, val);
-    }  // for n
-  }
-  reduce_output(out, value);
-}
-
 template <int DIM, int N>
 struct ZipImplBody<VariantKind::GPU, DIM, N> {
   TaskContext context;
   explicit ZipImplBody(TaskContext context) : context(context) {}
 
   using VAL = int64_t;
-
-  void check_out_of_bounds(const Buffer<AccessorRO<int64_t, DIM>, 1>& index_arrays,
-                           const int64_t volume,
-                           const Rect<DIM>& rect,
-                           const Pitches<DIM - 1>& pitches,
-                           const int64_t narrays,
-                           const int64_t start_index,
-                           const DomainPoint& shape,
-                           cudaStream_t stream) const
-  {
-    const size_t blocks = (volume + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    size_t shmem_size   = THREADS_PER_BLOCK / 32 * sizeof(bool);
-    DeviceScalarReductionBuffer<SumReduction<bool>> out_of_bounds(stream);
-    if (blocks >= MAX_REDUCTION_CTAS) {
-      const size_t iters = (blocks + MAX_REDUCTION_CTAS - 1) / MAX_REDUCTION_CTAS;
-      check_kernel<<<MAX_REDUCTION_CTAS, THREADS_PER_BLOCK, shmem_size, stream>>>(
-        out_of_bounds, index_arrays, volume, iters, rect, pitches, narrays, start_index, shape);
-    } else {
-      check_kernel<<<blocks, THREADS_PER_BLOCK, shmem_size, stream>>>(
-        out_of_bounds, index_arrays, volume, 1, rect, pitches, narrays, start_index, shape);
-    }
-    CUPYNUMERIC_CHECK_CUDA_STREAM(stream);
-
-    bool res = out_of_bounds.read(stream);
-    if (res) {
-      throw legate::TaskException("index is out of bounds in index array");
-    }
-  }
 
   template <size_t... Is>
   void operator()(const AccessorWO<Point<N>, DIM>& out,
@@ -179,7 +122,7 @@ struct ZipImplBody<VariantKind::GPU, DIM, N> {
       index_buf[idx] = index_arrays[idx];
     }
     if (check_bounds) {
-      check_out_of_bounds(
+      check_index_arrays_out_of_bounds<DIM>(
         index_buf, volume, rect, pitches, index_arrays.size(), start_index, shape, stream);
     }
 

@@ -716,9 +716,9 @@ class DeferredArray:
     def scalar(self) -> bool:
         return self.base.has_scalar_storage and self.base.size == 1
 
-    def _zip_indices(
-        self, start_index: int, arrays: tuple[Any, ...], check_bounds: bool
-    ) -> DeferredArray:
+    def _prepare_zip_indices(
+        self, start_index: int, arrays: tuple[Any, ...]
+    ) -> tuple[int, tuple[Any, ...], int, NdShape]:
         if not isinstance(arrays, tuple):
             raise TypeError("zip_indices expects tuple of arrays")
         # start_index is the index from witch indices arrays are passed
@@ -772,15 +772,29 @@ class DeferredArray:
                 promoted += (a,)
             raw_arrays = promoted
 
-        # The ZIP output has the same shape as the (promoted/broadcast) inputs —
-        # it is an isomorphic store, not a truly unbound one.  Pass the Legate
-        # Shape from the first processed input directly; reading its extents
-        # (which would block) is deferred until Legate needs them.
-        # NOTE: We need a RegionField of Point<N> dtype to store N-dimensional
-        # index points used as the indirection field in a copy.
+        # The (promoted/broadcast) inputs are isomorphic to the ZIP output:
+        # post-promotion their shape is exactly the output shape.  Returning
+        # ``raw_arrays[0].shape`` keeps callers non-blocking — its extents
+        # (which would block) are only read when Legate needs them.
+        return start_index, raw_arrays, key_dim, raw_arrays[0].shape
+
+    def _zip_indices(
+        self, start_index: int, arrays: tuple[Any, ...], check_bounds: bool
+    ) -> DeferredArray:
+        start_index, raw_arrays, key_dim, out_shape = (
+            self._prepare_zip_indices(start_index, arrays)
+        )
+
+        # The ZIP output has the same shape as the (promoted/broadcast)
+        # inputs — it is an isomorphic store, not a truly unbound one.
+        # Pass the Legate Shape directly; reading its extents (which would
+        # block) is deferred until Legate needs them.
+        # NOTE: We need a RegionField of Point<N> dtype to store
+        # N-dimensional index points used as the indirection field in a
+        # copy.
         pointN_dtype = ty.point_type(self.ndim)
         output_store = legate_runtime.create_store(
-            pointN_dtype, shape=raw_arrays[0].shape
+            pointN_dtype, shape=out_shape
         )
         output_arr = DeferredArray(base=output_store)
 
@@ -853,7 +867,7 @@ class DeferredArray:
 
     def _try_single_boolean_array_index_get(
         self, key: IndexKey
-    ) -> tuple[bool, Any, Any, Any] | None:
+    ) -> tuple[bool, DeferredArray, DeferredArray, DeferredArray] | None:
         """
         Try to handle single boolean array indexing for get operations: result = a[bool_mask]
 
@@ -871,7 +885,7 @@ class DeferredArray:
 
     def _try_single_boolean_array_index_set(
         self, key: IndexKey, value: Any
-    ) -> tuple[bool, Any, Any, Any] | None:
+    ) -> tuple[bool, DeferredArray, DeferredArray, DeferredArray] | None:
         """
         Try to handle single boolean array indexing for set operations: a[bool_mask] = value
 
@@ -1112,6 +1126,88 @@ class DeferredArray:
         task.add_broadcast(index_array)
         task.execute()
 
+    def _issue_zipgather_task(
+        self,
+        result: LogicalStore,
+        source: LogicalStore,
+        start_index: int,
+        arrays: tuple[Any, ...],
+        key_dim: int,
+        out_shape: NdShape,
+        check_bounds: bool,
+    ) -> None:
+        """
+        Task-based fused zip + gather for single-GPU advanced indexing.
+        Semantics: result[p] = source[zip(arrays)[p]] for all p.
+        """
+        assert runtime.num_procs == 1, (
+            "CuPyNumeric zipgather task only supported on single-process; "
+            "use the zip + gather path otherwise"
+        )
+        assert result.shape == out_shape, (
+            f"output shape {result.shape} != zipgather shape {out_shape}"
+        )
+
+        task = legate_runtime.create_auto_task(
+            self.library, CuPyNumericOpCode.ZIPGATHER
+        )
+        if check_bounds:
+            task.throws_exception(IndexError)
+
+        task.add_output(result)
+        task.add_input(source)
+        task.add_scalar_arg(key_dim, ty.int64)
+        task.add_scalar_arg(start_index, ty.int64)
+        task.add_scalar_arg(self.shape, (ty.int64,))
+        task.add_scalar_arg(check_bounds, ty.bool_)
+        task.add_broadcast(result)
+        task.add_broadcast(source)
+        for a in arrays:
+            task.add_input(a)
+            task.add_broadcast(a)
+        task.execute()
+
+    def _zipgather(
+        self, start_index: int, arrays: tuple[Any, ...], check_bounds: bool
+    ) -> DeferredArray | None:
+        """
+        Try the fused zip + gather fast path for advanced indexing.
+
+        Returns a fully-computed gather result when all of the following hold:
+          * Single GPU/CPU (``runtime.num_procs == 1``) — multi-rank advanced
+            indexing falls back to the partitioned zip + gather pipeline.
+          * The source has rank > 0 — scalar (0-D) sources don't reach this
+            path.
+          * The output is non-scalar — a scalar output (e.g. ``a[i, j]``
+            with all scalar indices) is handled by the regular indexing
+            machinery.
+
+        Returns ``None`` if any precondition fails so the caller can fall
+        back to ``_zip_indices`` followed by a separate gather.
+        """
+        # Reject the easy cases up front so we don't pay for the (broadcast +
+        # promote) work in ``_prepare_zip_indices`` when we'll bail out anyway.
+        if runtime.num_procs != 1 or self.base.ndim == 0:
+            return None
+
+        start_index, arrays, key_dim, out_shape = self._prepare_zip_indices(
+            start_index, arrays
+        )
+        if out_shape == ():
+            return None
+
+        result = runtime.create_deferred_thunk(out_shape, self.base.type)
+        self._issue_zipgather_task(
+            result.base,
+            self.base,
+            start_index,
+            arrays,
+            key_dim,
+            out_shape,
+            check_bounds,
+        )
+        return result
+
     def _perform_gather(
         self,
         result: LogicalStore,
@@ -1252,7 +1348,7 @@ class DeferredArray:
 
     def _advanced_indexing_using_take(
         self, mask_axis: int, mask_array: Any
-    ) -> tuple[bool, Any, Any, Any]:
+    ) -> tuple[bool, DeferredArray, DeferredArray, DeferredArray]:
         """Optimised path for a[indices, :, :] (or similar) using np.take."""
         # Call _take_using_take_task directly to avoid re-entering the
         # advanced-indexing shortcut and causing infinite recursion.
@@ -1319,20 +1415,45 @@ class DeferredArray:
             or can_use_nccl_scatter
         )
 
-    def _create_indexing_array(
-        self, key: Any, is_set: bool = False, set_value: Any | None = None
-    ) -> tuple[bool, DeferredArray, DeferredArray, DeferredArray]:
-        # Try to handle single boolean array indexing first
-        if is_set:
-            boolean_result = self._try_single_boolean_array_index_set(
-                key, set_value
-            )
-        else:
-            boolean_result = self._try_single_boolean_array_index_get(key)
+    def _try_advanced_indexing_using_take(
+        self, key: Any
+    ) -> tuple[bool, DeferredArray, DeferredArray, DeferredArray] | None:
+        """
+        Try the ``np.take`` fast path for ``a[indices, :, :]`` / ``a[:, indices]``.
 
-        if boolean_result is not None:
-            return boolean_result
-        # general advanced indexing case
+        Returns the same 4-tuple as ``_advanced_indexing_using_take`` if the
+        shortcut applies, otherwise ``None``.
+        """
+        computed_key: tuple[Any, ...]
+        if isinstance(key, DeferredArray):
+            computed_key = (key,)
+        else:
+            computed_key = key
+        assert isinstance(computed_key, tuple)
+        computed_key = self._unpack_ellipsis(computed_key, self.ndim)
+        can_use_take_path, mask_axis, mask_array = self._check_if_can_use_take(
+            computed_key
+        )
+        if not can_use_take_path:
+            return None
+        return self._advanced_indexing_using_take(mask_axis, mask_array)
+
+    def _prepare_advanced_indexing_inputs(
+        self, key: Any, is_set: bool, set_value: Any | None
+    ) -> tuple[DeferredArray, int, tuple[Any, ...], DeferredArray]:
+        """
+        Prepare the inputs for the general advanced-indexing path.
+
+        Callers must have already ruled out the single-boolean-array and
+        ``np.take`` shortcuts.  Parses the key (ellipsis unpacking,
+        transpose, project/promote/slice), extracts the integer index
+        arrays, and returns the (possibly copied) right-hand side
+        ``rhs`` together with the raw index arrays.  The same outputs
+        feed both ``rhs._zip_indices(...)`` (which produces the final
+        indexing array for a separate gather) and
+        ``rhs._zipgather(...)`` (which fuses the zip + gather into a
+        single single-GPU kernel).
+        """
         store = self.base
         rhs = self
         computed_key: tuple[Any, ...]
@@ -1342,15 +1463,6 @@ class DeferredArray:
             computed_key = key
         assert isinstance(computed_key, tuple)
         computed_key = self._unpack_ellipsis(computed_key, self.ndim)
-
-        # Shortcut: a[indices, :, :] / a[:, indices] → np.take
-        can_use_take_path, mask_axis, mask_array = self._check_if_can_use_take(
-            computed_key
-        )
-
-        # ndim > 1: 1-D gather (a[indices]) falls through to _issue_gather_task below.
-        if not is_set and self.ndim > 1 and can_use_take_path:
-            return self._advanced_indexing_using_take(mask_axis, mask_array)
 
         # the index where the first index_array is passed to the [] operator
         start_index = -1
@@ -1441,15 +1553,43 @@ class DeferredArray:
             )
             rhs = transformed_rhs if can_skip_copy else self._copy_store(store)
 
-        if len(tuple_of_arrays) <= rhs.ndim:
-            output_arr = rhs._zip_indices(
-                start_index,
-                tuple_of_arrays,
-                check_bounds=settings.bounds_check_enabled("indexing"),
-            )
-            return True, rhs, output_arr, self
-        else:
+        if len(tuple_of_arrays) > rhs.ndim:
             raise ValueError("Advanced indexing dimension mismatch")
+
+        return rhs, start_index, tuple_of_arrays, self
+
+    def _create_indexing_array(
+        self, key: Any, is_set: bool = False, set_value: Any | None = None
+    ) -> tuple[bool, DeferredArray, DeferredArray, DeferredArray]:
+        # Try to handle single boolean array indexing first
+        if is_set:
+            boolean_result = self._try_single_boolean_array_index_set(
+                key, set_value
+            )
+        else:
+            boolean_result = self._try_single_boolean_array_index_get(key)
+
+        if boolean_result is not None:
+            return boolean_result
+
+        # Shortcut: a[indices, :, :] / a[:, indices] → np.take.  Only valid
+        # for get-item; ndim > 1 keeps the 1-D gather (a[indices]) on the
+        # _issue_gather_task path below.
+        if not is_set and self.ndim > 1:
+            take_result = self._try_advanced_indexing_using_take(key)
+            if take_result is not None:
+                return take_result
+
+        # General advanced-indexing case: prepare raw index arrays then zip.
+        rhs, start_index, tuple_of_arrays, new_self = (
+            self._prepare_advanced_indexing_inputs(key, is_set, set_value)
+        )
+        output_arr = rhs._zip_indices(
+            start_index,
+            tuple_of_arrays,
+            check_bounds=settings.bounds_check_enabled("indexing"),
+        )
+        return True, rhs, output_arr, new_self
 
     @staticmethod
     def _unpack_ellipsis(key: tuple[Any, ...], ndim: int) -> tuple[Any, ...]:
@@ -1525,37 +1665,62 @@ class DeferredArray:
     def get_item(self, key: IndexKey) -> DeferredArray:
         # Check to see if this is advanced indexing or not
         if is_advanced_indexing(key):
-            # Create the indexing array
-            (copy_needed, rhs, index_array, self) = (
-                self._create_indexing_array(key)
+            # Single boolean-array fast path returns the final result
+            # directly — no zip / gather needed.
+            boolean_result = self._try_single_boolean_array_index_get(key)
+            if boolean_result is not None:
+                return boolean_result[2]
+
+            # ``np.take`` fast path for ``a[indices, :, :]`` / ``a[:, indices]``.
+            # ndim > 1 keeps the 1-D gather (a[indices]) on the gather path.
+            if self.ndim > 1:
+                take_result = self._try_advanced_indexing_using_take(key)
+                if take_result is not None:
+                    return take_result[2]
+
+            # General advanced-indexing path: derive the raw index arrays
+            # once so we can choose between the fused single-GPU
+            # zipgather and the fallback zip + gather without redoing
+            # the work.
+            rhs, start_index, tuple_of_arrays, self = (
+                self._prepare_advanced_indexing_inputs(
+                    key, is_set=False, set_value=None
+                )
+            )
+            check_bounds = settings.bounds_check_enabled("indexing")
+
+            fused_result = rhs._zipgather(
+                start_index, tuple_of_arrays, check_bounds=check_bounds
+            )
+            if fused_result is not None:
+                return fused_result
+
+            index_array = rhs._zip_indices(
+                start_index, tuple_of_arrays, check_bounds=check_bounds
             )
 
-            if copy_needed:
-                if rhs.base.has_scalar_storage:
-                    rhs = rhs._convert_future_to_regionfield()
-                result: DeferredArray
-                if index_array.base.has_scalar_storage:
-                    index_array = index_array._convert_future_to_regionfield()
-                    result_store = legate_runtime.create_store(
-                        self.base.type,
-                        shape=index_array.shape,
-                        optimize_scalar=False,
-                    )
-                    result = DeferredArray(base=result_store)
-
-                else:
-                    # The gather output is isomorphic to the index array — same
-                    # shape, just a different element type.  Pass the Legate
-                    # Shape directly; reading its extents (which would block)
-                    # is deferred until Legate actually needs them.
-                    result_store = legate_runtime.create_store(
-                        self.base.type, shape=index_array.base.shape
-                    )
-                    result = DeferredArray(base=result_store)
-
-                self._perform_gather(result.base, rhs.base, index_array.base)
+            if rhs.base.has_scalar_storage:
+                rhs = rhs._convert_future_to_regionfield()
+            result: DeferredArray
+            if index_array.base.has_scalar_storage:
+                index_array = index_array._convert_future_to_regionfield()
+                result_store = legate_runtime.create_store(
+                    self.base.type,
+                    shape=index_array.shape,
+                    optimize_scalar=False,
+                )
+                result = DeferredArray(base=result_store)
             else:
-                return index_array
+                # The gather output is isomorphic to the index array — same
+                # shape, just a different element type.  Pass the Legate
+                # Shape directly; reading its extents (which would block)
+                # is deferred until Legate actually needs them.
+                result_store = legate_runtime.create_store(
+                    self.base.type, shape=index_array.base.shape
+                )
+                result = DeferredArray(base=result_store)
+
+            self._perform_gather(result.base, rhs.base, index_array.base)
 
         else:
             # Not advanced indexing - key is a tuple (converted by ndarray._convert_key)

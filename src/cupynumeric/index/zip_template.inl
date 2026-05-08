@@ -20,6 +20,10 @@
 #include "cupynumeric/index/zip.h"
 #include "cupynumeric/pitches.h"
 
+#if LEGATE_DEFINED(LEGATE_USE_CUDA) and LEGATE_DEFINED(LEGATE_NVCC)
+#include "cupynumeric/cuda_help.h"
+#endif
+
 namespace cupynumeric {
 
 using namespace legate;
@@ -107,5 +111,73 @@ static void zip_template(TaskContext& context)
   int dim = std::max(1, args.inputs[0].dim());
   double_dispatch(dim, N, ZipImpl<KIND>{context}, args);
 }
+
+#if LEGATE_DEFINED(LEGATE_USE_CUDA) and LEGATE_DEFINED(LEGATE_NVCC)
+// Reduction kernel that flags whether any element of any per-dim index array
+// falls outside its corresponding extent in `shape`. Each thread sweeps
+// `iters` chunks of `volume` so we can launch with a capped grid size.
+// Shared between ZipTask and ZipGatherTask GPU variants.
+template <typename Output, int DIM>
+__global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
+  index_bounds_check_kernel(Output out,
+                            const Buffer<AccessorRO<int64_t, DIM>, 1> index_arrays,
+                            const int64_t volume,
+                            const int64_t iters,
+                            const Rect<DIM> rect,
+                            const Pitches<DIM - 1> pitches,
+                            const int64_t narrays,
+                            const int64_t start_index,
+                            const DomainPoint shape)
+{
+  bool value = false;
+  for (size_t i = 0; i < iters; ++i) {
+    const auto idx = (i * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= volume) {
+      break;
+    }
+    const auto p = pitches.unflatten(idx, rect.lo);
+    for (size_t n = 0; n < narrays; ++n) {
+      const int64_t extent = shape[start_index + n];
+      const coord_t idx    = compute_idx_unchecked(index_arrays[n][p], extent);
+      const bool oob       = (idx < 0 || idx >= extent);
+      SumReduction<bool>::fold<true>(value, oob);
+    }
+  }
+  reduce_output(out, value);
+}
+
+// Host-side wrapper used by both ZipTask and ZipGatherTask GPU variants.
+// Throws a legate::TaskException if any index in the supplied arrays is out
+// of range for its corresponding extent in `shape`.
+template <int DIM>
+inline void check_index_arrays_out_of_bounds(
+  const Buffer<AccessorRO<int64_t, DIM>, 1>& index_arrays,
+  const int64_t volume,
+  const Rect<DIM>& rect,
+  const Pitches<DIM - 1>& pitches,
+  const int64_t narrays,
+  const int64_t start_index,
+  const DomainPoint& shape,
+  cudaStream_t stream)
+{
+  const size_t blocks     = (volume + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+  const size_t shmem_size = THREADS_PER_BLOCK / 32 * sizeof(bool);
+
+  DeviceScalarReductionBuffer<SumReduction<bool>> out_of_bounds(stream);
+  if (blocks >= MAX_REDUCTION_CTAS) {
+    const size_t iters = (blocks + MAX_REDUCTION_CTAS - 1) / MAX_REDUCTION_CTAS;
+    index_bounds_check_kernel<<<MAX_REDUCTION_CTAS, THREADS_PER_BLOCK, shmem_size, stream>>>(
+      out_of_bounds, index_arrays, volume, iters, rect, pitches, narrays, start_index, shape);
+  } else {
+    index_bounds_check_kernel<<<blocks, THREADS_PER_BLOCK, shmem_size, stream>>>(
+      out_of_bounds, index_arrays, volume, 1, rect, pitches, narrays, start_index, shape);
+  }
+  CUPYNUMERIC_CHECK_CUDA_STREAM(stream);
+
+  if (out_of_bounds.read(stream)) {
+    throw legate::TaskException("index is out of bounds in index array");
+  }
+}
+#endif  // LEGATE_DEFINED(LEGATE_NVCC)
 
 }  // namespace cupynumeric

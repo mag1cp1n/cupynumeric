@@ -90,6 +90,7 @@ enum CuPyNumericOpCode {
   CUPYNUMERIC_WRAP,
   CUPYNUMERIC_WRITE,
   CUPYNUMERIC_ZIP,
+  CUPYNUMERIC_ZIPGATHER,
 };
 
 // Match these to UnaryOpCode in config.py
