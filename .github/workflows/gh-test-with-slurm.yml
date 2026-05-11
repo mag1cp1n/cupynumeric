@@ -106,18 +106,13 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ env.ARTIFACTS_DIR }}
 
-      - name: Move build artifacts to Slurm shared directory (matrix subdir)
+      - name: Move build artifacts to the Slurm shared directory
         id: move-artifacts
         run: |
-          PY="${{ inputs.python-version }}"
-          CUDA="${{ inputs.cuda-version }}"
-          MATRIX_SLUG="py_${PY}__cuda_${CUDA:-none}"
-          ARTIFACTS_SHARED="${{ steps.unique_dir.outputs.path }}/matrix/${MATRIX_SLUG}"
-          mkdir -p "${ARTIFACTS_SHARED}"
           # cp and then rm to avoid "Device or resource busy"
-          cp -a "${ARTIFACTS_DIR}" "${ARTIFACTS_SHARED}/"
+          cp -a "${ARTIFACTS_DIR}" "${{ steps.unique_dir.outputs.path }}/"
           rm -rf "${ARTIFACTS_DIR}"
-          echo "moved_artifacts_dir=${ARTIFACTS_SHARED}/artifacts" >> "${GITHUB_OUTPUT}"
+          echo "moved_artifacts_dir=${{ steps.unique_dir.outputs.path }}/$(basename "${ARTIFACTS_DIR}")" | tee -a "${GITHUB_OUTPUT}"
 
       - name: Copy repository from the runner workspace to the slurm shared directory
         id: clone-cupynumeric
