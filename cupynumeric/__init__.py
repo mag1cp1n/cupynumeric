@@ -26,7 +26,7 @@ with GPU acceleration.
 from __future__ import annotations
 
 
-from . import linalg, random, fft  # noqa: F401
+from . import fft, linalg, ndimage, random  # noqa: F401
 from ._array.array import ndarray  # noqa: F401
 from ._array_api import (  # noqa: F401
     ArrayNamespaceInfo,

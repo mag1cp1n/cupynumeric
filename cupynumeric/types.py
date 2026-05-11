@@ -36,6 +36,17 @@ ConvolveMode: TypeAlias = Literal["full", "valid", "same"]
 
 ConvolveMethod: TypeAlias = Literal["auto", "direct", "fft"]
 
+NdimageConvolveMode: TypeAlias = Literal[
+    "reflect",
+    "constant",
+    "nearest",
+    "mirror",
+    "wrap",
+    "grid-mirror",
+    "grid-constant",
+    "grid-wrap",
+]
+
 SelectKind: TypeAlias = Literal["introselect"]
 
 TransposeMode: TypeAlias = Literal[0, "N", 1, "T", 2, "C"]

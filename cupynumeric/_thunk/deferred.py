@@ -72,6 +72,7 @@ from ..config import (
     ConvertCode,
     ConvolveMethod,
     CuPyNumericOpCode,
+    NdimageConvolveModeCode,
     RandGenCode,
     UnaryOpCode,
     UnaryRedCode,
@@ -2115,6 +2116,36 @@ class DeferredArray:
         task.add_constraint(align(p_out, p_in))
         task.add_constraint(bloat(p_out, p_halo, offsets, offsets))
         task.add_constraint(broadcast(p_filter))
+
+        task.execute()
+
+    @auto_convert("input", "weights")
+    def ndimage_convolve(
+        self,
+        input: Any,
+        weights: Any,
+        mode: NdimageConvolveModeCode,
+        cval: Any,
+        origins: tuple[int, ...],
+    ) -> None:
+        task = legate_runtime.create_auto_task(
+            self.library, CuPyNumericOpCode.NDIMAGE_CONVOLVE
+        )
+
+        p_out = task.add_output(self.base)
+        p_input = task.add_input(input.base)
+        p_weights = task.add_input(weights.base)
+
+        task.add_scalar_arg(mode.value, ty.int32)
+        task.add_scalar_arg(cval, self.base.type)
+        for origin in origins:
+            task.add_scalar_arg(origin, ty.int64)
+
+        # TODO(dinodeep): Implement multi-GPU NDIMAGE_CONVOLVE
+        # using alignment instead of broadcast on input/output
+        task.add_constraint(broadcast(p_out, p_input))
+
+        task.add_constraint(broadcast(p_weights))
 
         task.execute()
 
