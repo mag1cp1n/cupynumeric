@@ -137,7 +137,7 @@ def test_expm_rnd_skew_h(n, min_v, max_v):
         # check diff in ||exp(A)||_2:
         #
         norm_exp_s = np.linalg.norm(out_s, ord=2)
-        norm_exp_num = np.linalg.norm(out_num, ord=2)
+        norm_exp_num = np.linalg.norm(out_num.__array__(), ord=2)
         #
         # conversion to string shows more decimals...
         #
