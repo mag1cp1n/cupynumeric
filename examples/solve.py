@@ -45,7 +45,7 @@ def solve(
     total = timer.stop()
 
     if perform_check:
-        check_result(a, b, x)
+        check_result(np, a, b, x)
 
     if print_timing:
         print(f"Elapsed Time: {total} ms")

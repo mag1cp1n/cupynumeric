@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <vector>
 
 // Useful for IDEs
@@ -63,18 +64,39 @@ struct SolveImpl {
     const auto b_shape = b_array.shape<DIM>();
     const auto x_shape = x_array.shape<DIM>();
 
-    if (a_shape.empty()) {
+    // Note that a, b and x may report different extents on the batch
+    // dimensions: when one of them was broadcast/promoted along a batch dim,
+    // the store cannot observe the partitioning along that fake dim and
+    // reports the full unpartitioned extent instead. Recover the real
+    // per-task working set on the batch dims by intersecting along those
+    // dims only (the trailing two dims differ between the stores: a is
+    // (m, n) while b and x are (m, nrhs)).
+    Rect<DIM> a_active = a_shape;
+    Rect<DIM> b_active = b_shape;
+    Rect<DIM> x_active = x_shape;
+    for (int32_t i = 0; i < DIM - 2; ++i) {
+      const auto lo  = std::max({a_shape.lo[i], b_shape.lo[i], x_shape.lo[i]});
+      const auto hi  = std::min({a_shape.hi[i], b_shape.hi[i], x_shape.hi[i]});
+      a_active.lo[i] = lo;
+      a_active.hi[i] = hi;
+      b_active.lo[i] = lo;
+      b_active.hi[i] = hi;
+      x_active.lo[i] = lo;
+      x_active.hi[i] = hi;
+    }
+
+    if (a_active.empty()) {
       return;
     }
 
-    const int64_t m    = a_shape.hi[DIM - 2] - a_shape.lo[DIM - 2] + 1;
-    const int64_t n    = a_shape.hi[DIM - 1] - a_shape.lo[DIM - 1] + 1;
-    const int64_t nrhs = b_shape.hi[DIM - 1] - b_shape.lo[DIM - 1] + 1;
+    const int64_t m    = a_active.hi[DIM - 2] - a_active.lo[DIM - 2] + 1;
+    const int64_t n    = a_active.hi[DIM - 1] - a_active.lo[DIM - 1] + 1;
+    const int64_t nrhs = b_active.hi[DIM - 1] - b_active.lo[DIM - 1] + 1;
 
     int64_t batchsize_total = 1;
     std::vector<int64_t> batchdims;
     for (auto i = 0; i < DIM - 2; ++i) {
-      batchdims.push_back(a_shape.hi[i] - a_shape.lo[i] + 1);
+      batchdims.push_back(a_active.hi[i] - a_active.lo[i] + 1);
       batchsize_total *= batchdims.back();
     }
 
@@ -83,12 +105,12 @@ struct SolveImpl {
     assert(nrhs > 0);
     assert(m == n);
     assert(batchsize_total > 0);
-    assert(b_shape.hi[DIM - 2] - b_shape.lo[DIM - 2] + 1 == m);
-    assert(x_shape.hi[DIM - 2] - x_shape.lo[DIM - 2] + 1 == m);
-    assert(x_shape.hi[DIM - 1] - x_shape.lo[DIM - 1] + 1 == nrhs);
+    assert(b_active.hi[DIM - 2] - b_active.lo[DIM - 2] + 1 == m);
+    assert(x_active.hi[DIM - 2] - x_active.lo[DIM - 2] + 1 == m);
+    assert(x_active.hi[DIM - 1] - x_active.lo[DIM - 1] + 1 == nrhs);
     for (auto i = 0; i < batchdims.size(); ++i) {
-      assert(b_shape.hi[i] - b_shape.lo[i] + 1 == batchdims[i]);
-      assert(x_shape.hi[i] - x_shape.lo[i] + 1 == batchdims[i]);
+      assert(b_active.hi[i] - b_active.lo[i] + 1 == batchdims[i]);
+      assert(x_active.hi[i] - x_active.lo[i] + 1 == batchdims[i]);
     }
 #endif
 
@@ -96,9 +118,9 @@ struct SolveImpl {
     size_t b_strides[DIM];
     size_t x_strides[DIM];
 
-    auto* a = a_array.read_accessor<VAL, DIM>(a_shape).ptr(a_shape, a_strides);
-    auto* b = b_array.read_accessor<VAL, DIM>(b_shape).ptr(b_shape, b_strides);
-    auto* x = x_array.write_accessor<VAL, DIM>(x_shape).ptr(x_shape, x_strides);
+    auto* a = a_array.read_accessor<VAL, DIM>(a_active).ptr(a_active, a_strides);
+    auto* b = b_array.read_accessor<VAL, DIM>(b_active).ptr(b_active, b_strides);
+    auto* x = x_array.write_accessor<VAL, DIM>(x_active).ptr(x_active, x_strides);
 
 #ifdef DEBUG_CUPYNUMERIC
     // per matrix col-major
