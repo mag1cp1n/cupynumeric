@@ -24,6 +24,7 @@ from utils.generators import mk_0to1_array, permutes_to
 from utils.utils import ONE_MAX_DIM_RANGE
 
 import cupynumeric as num
+from cupynumeric._module.linalg_mvp import _contract
 
 # Limits for exhaustive expression generation routines
 MAX_MODES = 3
@@ -392,6 +393,85 @@ def test_large_arrays_high_dimensions(ndim):
         np_sum_result = np.einsum(sum_expr, np_a)
         num_sum_result = num.einsum(sum_expr, num_a)
         assert allclose(np_sum_result, num_sum_result, rtol=1e-5)
+
+
+class TestLinalgMvpCoverage:
+    def test_einsum_optimize_false_null_optimizer(self) -> None:
+        a = num.arange(12.0).reshape(3, 4)
+        b = num.arange(20.0).reshape(4, 5)
+        c = num.arange(30.0).reshape(5, 6)
+        out_num = num.einsum("ij,jk,kl->il", a, b, c, optimize=False)
+        out_np = np.einsum(
+            "ij,jk,kl->il", np.asarray(a), np.asarray(b), np.asarray(c)
+        )
+        assert allclose(out_num, out_np)
+
+    def test_contract_wrong_a_ndim(self) -> None:
+        a = num.arange(6.0).reshape(2, 3)
+        with pytest.raises(
+            ValueError, match=r"Expected 2-d input array but got 1-d"
+        ):
+            _contract(["i", "j"], [], ["i"], a[0], b=None)
+
+    def test_contract_b_none_but_b_modes_non_empty(self) -> None:
+        a = num.arange(3.0)
+        with pytest.raises(ValueError, match="Missing input array"):
+            _contract(["i"], ["j"], ["i"], a, b=None)
+
+    def test_contract_wrong_b_ndim(self) -> None:
+        a = num.arange(3.0)
+        b = num.arange(6.0).reshape(2, 3)
+        with pytest.raises(
+            ValueError, match=r"Expected 1-d input array but got 2-d"
+        ):
+            _contract(["i"], ["j"], ["i", "j"], a, b=b)
+
+    def test_contract_duplicate_output_modes(self) -> None:
+        a = num.arange(3.0)
+        with pytest.raises(
+            ValueError, match="Duplicate mode labels on output"
+        ):
+            _contract(["i"], [], ["i", "i"], a, b=None)
+
+    def test_contract_unknown_output_modes(self) -> None:
+        a = num.arange(3.0)
+        with pytest.raises(ValueError, match="Unknown mode labels on output"):
+            _contract(["i"], [], ["j"], a, b=None)
+
+    def test_einsum_out_incompatible_dtype_safe_casting(self) -> None:
+        a = num.ones((3, 4), dtype=np.float64)
+        b = num.ones((4, 2), dtype=np.float64)
+        out_num = num.zeros((3, 2), dtype=np.int32)
+        msg = r"Cannot cast intermediate result array of type .* into output array of type int32 with casting rule 'safe'"
+        with pytest.raises(TypeError, match=msg):
+            num.einsum(
+                "ij,jk->ik",
+                a,
+                b,
+                out=out_num,
+                dtype=np.float64,
+                casting="safe",
+            )
+        with pytest.raises(TypeError):
+            np.einsum(
+                "ij,jk->ik",
+                np.asarray(a),
+                np.asarray(b),
+                out=np.zeros((3, 2), dtype=np.int32),
+                dtype=np.float64,
+                casting="safe",
+            )
+
+
+def test_broadcast_into_out() -> None:
+    np_a = np.ones((2, 1))
+    num_a = num.array(np_a)
+
+    np_out = np.zeros((2, 3))
+    num_out = num.zeros((2, 3))
+    np.einsum("ab->ab", np_a, out=np_out)
+    num.einsum("ab->ab", num_a, out=num_out)
+    assert allclose(np_out, num_out)
 
 
 if __name__ == "__main__":

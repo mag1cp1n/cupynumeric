@@ -619,10 +619,7 @@ def _contract(
                 f"into output array of type {out_dtype} with casting rule "
                 f"'{casting}'"
             )
-        if out is None:
-            out = ndarray._from_inputs(
-                shape=out_shape, dtype=out_dtype, inputs=(c,)
-            )
+        assert out is not None
         out[...] = c.reshape(c_bloated_shape)
         return out
     if out_shape != c_shape:
