@@ -16,9 +16,32 @@ echo "Building a wheel..."
 
 pwd
 
+# Determine the parallel level based on core count
+PARALLEL_LEVEL_COUNT=$(nproc --all --ignore=2)
+echo "PARALLEL_LEVEL_COUNT=${PARALLEL_LEVEL_COUNT}"
+
+# Determine the parallel level based on available memory
+# Note: 16-core 64GB runners building with -j14 have ~4.5GB / core. ARM64/CUDA 13
+# builders are intermittently dying with OOM failures when enabling cuDNN; bumping
+# the limit to 5GB reduces the parallelism to -j12 and resolves the OOM failures
+# for the time being until the underlying issue can be traced further and
+# possibly reduced back to 4.5GB or less
+GBPerCore=5
+KBTotal=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+PARALLEL_LEVEL_MEM=$(( KBTotal / (GBPerCore*1024*1024) ))
+PARALLEL_LEVEL_MEM=$(( PARALLEL_LEVEL_MEM < 1 ? 1 : PARALLEL_LEVEL_MEM ))
+echo "PARALLEL_LEVEL_MEM=${PARALLEL_LEVEL_MEM}"
+
+# Default to the lesser parallel level between core count and available memory
+PARALLEL_LEVEL_DEFAULT=$(( PARALLEL_LEVEL_COUNT < PARALLEL_LEVEL_MEM ? PARALLEL_LEVEL_COUNT : PARALLEL_LEVEL_MEM ))
+echo "PARALLEL_LEVEL_DEFAULT=${PARALLEL_LEVEL_DEFAULT}"
+
+export PARALLEL_LEVEL=${PARALLEL_LEVEL:-${PARALLEL_LEVEL_DEFAULT}}
+echo "PARALLEL_LEVEL=${PARALLEL_LEVEL}"
+
 # Configure and enable sccache for the build.
 source legate-configure-sccache
-export CMAKE_BUILD_PARALLEL_LEVEL=${PARALLEL_LEVEL:=8}
+export CMAKE_BUILD_PARALLEL_LEVEL=${PARALLEL_LEVEL}
 export CUDA_MAJOR_VER=${CUDA_MAJOR_VER:=13}
 
 if [[ "${CI:-false}" == "true" ]]; then
