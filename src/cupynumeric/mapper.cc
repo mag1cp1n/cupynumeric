@@ -374,14 +374,27 @@ std::optional<std::size_t> CuPyNumericMapper::allocation_pool_size(
           return max_out_size;
         }
         case legate::mapping::StoreTarget::FBMEM: {
-          // Add extra buffer for intermediate offset array calculation
-          const auto offset_size =
-            aligned_size(input_volume * sizeof(std::uint64_t), DEFAULT_ALIGNMENT);
-
-          // Consider min buffer for thrust scan temps (necessary for smaller task inputs)
-          constexpr std::size_t MIN_THRUST_SCAN_TEMP_SIZE = 2048;
-
-          return MIN_THRUST_SCAN_TEMP_SIZE + offset_size + max_out_size;
+          // TEMPORARY WORKAROUND: drop the FBMEM upper-bound pool request so
+          // Legate allocates the actual buffers at task execution time. The
+          // upper-bound calculation below assumes 100% mask density
+          // (max_out_size = input_volume * element_size), which significantly
+          // overestimates real usage for typical sparse masks and causes OOM
+          // on large microbenchmarks even when the actual peak fits.
+          //
+          // Restore the original calculation once the scan-buffer / output
+          // sizing is fixed in advanced_indexing.cu (tiled scan or
+          // count-then-copy implementation).
+          //
+          // Original implementation (restore when structural fix lands):
+          //   // Add extra buffer for intermediate offset array calculation
+          //   const auto offset_size =
+          //     aligned_size(input_volume * sizeof(std::uint64_t), DEFAULT_ALIGNMENT);
+          //
+          //   // Consider min buffer for thrust scan temps (necessary for smaller task inputs)
+          //   constexpr std::size_t MIN_THRUST_SCAN_TEMP_SIZE = 2048;
+          //
+          //   return MIN_THRUST_SCAN_TEMP_SIZE + offset_size + max_out_size;
+          return std::nullopt;
         }
         case legate::mapping::StoreTarget::ZCMEM: {
           return 0;
