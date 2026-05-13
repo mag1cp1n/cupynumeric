@@ -37,6 +37,40 @@ static bool same_size_ranges_overlap(const void* lhs, const void* rhs, size_t by
   return lhs_begin - rhs_begin < bytes;
 }
 
+static cudaMemcpyKind dense_copy_kind(mapping::StoreTarget out, mapping::StoreTarget in)
+{
+  switch (out) {
+    case mapping::StoreTarget::FBMEM: {
+      switch (in) {
+        case mapping::StoreTarget::FBMEM: return cudaMemcpyDeviceToDevice;
+        case mapping::StoreTarget::ZCMEM: return cudaMemcpyHostToDevice;
+        case mapping::StoreTarget::SYSMEM: [[fallthrough]];
+        case mapping::StoreTarget::SOCKETMEM: {
+          LEGATE_ABORT("GPU dense copy input store is not GPU-visible: ", in);
+        }
+      }
+      break;
+    }
+    case mapping::StoreTarget::ZCMEM: {
+      switch (in) {
+        case mapping::StoreTarget::FBMEM: return cudaMemcpyDeviceToHost;
+        case mapping::StoreTarget::ZCMEM: return cudaMemcpyHostToHost;
+        case mapping::StoreTarget::SYSMEM: [[fallthrough]];
+        case mapping::StoreTarget::SOCKETMEM: {
+          LEGATE_ABORT("GPU dense copy input store is not GPU-visible: ", in);
+        }
+      }
+      break;
+    }
+    case mapping::StoreTarget::SYSMEM: [[fallthrough]];
+    case mapping::StoreTarget::SOCKETMEM: {
+      LEGATE_ABORT("GPU dense copy output store is not GPU-visible: ", out);
+    }
+  }
+  LEGATE_ABORT("Unhandled store target for GPU dense copy");
+  return cudaMemcpyDefault;
+}
+
 template <typename Function, typename ARG, typename RES>
 static __global__ void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
   dense_kernel(size_t volume, Function func, RES* out, const ARG* in)
@@ -101,7 +135,9 @@ struct UnaryOpImplBody<VariantKind::GPU, OP_CODE, CODE, DIM> {
                   AccessorRO<ARG, DIM> in,
                   const Pitches<DIM - 1>& pitches,
                   const Rect<DIM>& rect,
-                  bool dense) const
+                  bool dense,
+                  mapping::StoreTarget out_target,
+                  mapping::StoreTarget in_target) const
   {
     const size_t volume = rect.volume();
     const size_t blocks = (volume + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
@@ -111,16 +147,16 @@ struct UnaryOpImplBody<VariantKind::GPU, OP_CODE, CODE, DIM> {
       auto inptr  = in.ptr(rect);
       if constexpr (OP_CODE == UnaryOpCode::COPY) {
         static_assert(std::is_same_v<ARG, RES>, "COPY must use matching input and output types");
-        const size_t bytes = volume * sizeof(ARG);
+        const size_t bytes   = volume * sizeof(ARG);
+        const auto copy_kind = dense_copy_kind(out_target, in_target);
         if (outptr == inptr) {
           // Exact self-copy is already complete.
           return;
         }
-        if (!same_size_ranges_overlap(outptr, inptr, bytes)) {
-          CUPYNUMERIC_CHECK_CUDA(
-            cudaMemcpyAsync(outptr, inptr, bytes, cudaMemcpyDeviceToDevice, stream));
-        } else {
+        if (same_size_ranges_overlap(outptr, inptr, bytes)) {
           dense_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(volume, func, outptr, inptr);
+        } else {
+          CUPYNUMERIC_CHECK_CUDA(cudaMemcpyAsync(outptr, inptr, bytes, copy_kind, stream));
         }
       } else {
         dense_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(volume, func, outptr, inptr);
@@ -142,24 +178,26 @@ struct PointCopyImplBody<VariantKind::GPU, VAL, DIM> {
                   AccessorRO<VAL, DIM> in,
                   const Pitches<DIM - 1>& pitches,
                   const Rect<DIM>& rect,
-                  bool dense) const
+                  bool dense,
+                  mapping::StoreTarget out_target,
+                  mapping::StoreTarget in_target) const
   {
     const size_t volume = rect.volume();
     const size_t blocks = (volume + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     auto stream         = context.get_task_stream();
     if (dense) {
-      auto outptr        = out.ptr(rect);
-      auto inptr         = in.ptr(rect);
-      const size_t bytes = volume * sizeof(VAL);
+      auto outptr          = out.ptr(rect);
+      auto inptr           = in.ptr(rect);
+      const size_t bytes   = volume * sizeof(VAL);
+      const auto copy_kind = dense_copy_kind(out_target, in_target);
       if (outptr == inptr) {
         // Exact self-copy is already complete.
         return;
       }
-      if (!same_size_ranges_overlap(outptr, inptr, bytes)) {
-        CUPYNUMERIC_CHECK_CUDA(
-          cudaMemcpyAsync(outptr, inptr, bytes, cudaMemcpyDeviceToDevice, stream));
-      } else {
+      if (same_size_ranges_overlap(outptr, inptr, bytes)) {
         dense_copy_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(volume, outptr, inptr);
+      } else {
+        CUPYNUMERIC_CHECK_CUDA(cudaMemcpyAsync(outptr, inptr, bytes, copy_kind, stream));
       }
     } else {
       generic_copy_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(volume, out, in, pitches, rect);

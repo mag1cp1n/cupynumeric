@@ -66,7 +66,14 @@ struct UnaryOpImpl {
 #endif
 
     OP func{args.args};
-    UnaryOpImplBody<KIND, OP_CODE, CODE, DIM>{context}(func, out, in, pitches, rect, dense);
+    if constexpr (KIND == VariantKind::GPU) {
+      const auto out_target = args.out.target();
+      const auto in_target  = args.in.target();
+      UnaryOpImplBody<KIND, OP_CODE, CODE, DIM>{context}(
+        func, out, in, pitches, rect, dense, out_target, in_target);
+    } else {
+      UnaryOpImplBody<KIND, OP_CODE, CODE, DIM>{context}(func, out, in, pitches, rect, dense);
+    }
   }
 
   template <Type::Code CODE, int DIM, std::enable_if_t<!UnaryOp<OP_CODE, CODE>::valid>* = nullptr>
@@ -169,7 +176,14 @@ struct UnaryCopyImpl {
     bool dense = false;
 #endif
 
-    PointCopyImplBody<KIND, VAL, DIM>{context}(out, in, pitches, rect, dense);
+    if constexpr (KIND == VariantKind::GPU) {
+      const auto out_target = args.out.target();
+      const auto in_target  = args.in.target();
+      PointCopyImplBody<KIND, VAL, DIM>{context}(
+        out, in, pitches, rect, dense, out_target, in_target);
+    } else {
+      PointCopyImplBody<KIND, VAL, DIM>{context}(out, in, pitches, rect, dense);
+    }
   }
 };
 
