@@ -54,6 +54,7 @@ import math
 import random
 
 from _benchmark import MicrobenchmarkSuite, timed_loop
+from _benchmark.harness import ArrayPackage
 from _benchmark.sizing import SizeRequest, resolve_linear_suite_size
 
 
@@ -310,9 +311,28 @@ def run_benchmarks(suite, size_request):
     )
 
     # 3. Non-contiguous indexing (indices on non-adjacent dims — ZIP + gather)
-    suite.run_timed_with_generator(
-        None, non_contiguous_indexing, arg_gen_3d(), timer=timer
-    )
+    # TODO: re-enable for >4 GPUs once the NCCL all2all crash is fixed.
+    # On 8+ GPUs the gather goes through _nccl_all2all_gather and fails with
+    # "Internal NCCL failure with error unhandled cuda error" at
+    # src/cupynumeric/all2all/all2all.cuh:316. Works on 1/2/4 GPUs.
+    skip_non_contiguous = False
+    suite_config = getattr(suite, "_config", None)
+    if (
+        suite_config is not None
+        and suite_config.package == ArrayPackage.LEGATE
+    ):
+        from cupynumeric.runtime import runtime
+
+        if runtime.num_gpus > 4:
+            skip_non_contiguous = True
+            suite.info(
+                f"Skipping general_indexing::non_contiguous_indexing on "
+                f"{runtime.num_gpus} GPUs: NCCL all2all crash above 4 GPUs"
+            )
+    if not skip_non_contiguous:
+        suite.run_timed_with_generator(
+            None, non_contiguous_indexing, arg_gen_3d(), timer=timer
+        )
 
     # 4. Boolean mask with slice: a[mask, :] — nonzero + ZIP + gather
     suite.run_timed(boolean_with_slice, np, ns, runs, warmup, timer=timer)
