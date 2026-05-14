@@ -21,12 +21,17 @@ from .harness import BenchmarkHarness, SummarizeFlush, parse_with_harness
 from .info import BenchmarkInfo, benchmark_info, get_benchmark_info
 from .summarize import Summarize
 from .timer import get_timer, timed_loop
-from .microbenchmark_utilities import MicrobenchmarkConfig, MicrobenchmarkSuite
+from .microbenchmark_utilities import (
+    MicrobenchmarkCall,
+    MicrobenchmarkConfig,
+    MicrobenchmarkSuite,
+)
 
 __all__ = (
     "BenchmarkHarness",
     "BenchmarkInfo",
     "MicrobenchmarkConfig",
+    "MicrobenchmarkCall",
     "MicrobenchmarkSuite",
     "Summarize",
     "SummarizeFlush",

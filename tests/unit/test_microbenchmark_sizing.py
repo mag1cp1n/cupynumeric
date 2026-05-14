@@ -4,6 +4,7 @@ import argparse
 import importlib
 import math
 import sys
+import warnings
 
 from functools import lru_cache
 from pathlib import Path
@@ -104,6 +105,52 @@ def test_size_request_parses_memory_target_mode() -> None:
     assert request.memory_target_bytes == [2 << 30]
 
 
+def test_size_request_parses_capacity_sweeps() -> None:
+    args = _build_size_parser().parse_args(["--memory-size", "1KiB", "2KiB"])
+    request = _sizing().SizeRequest.from_namespace(args)
+
+    assert request.exact_size is None
+    assert request.memory_target_bytes == [1 << 10, 2 << 10]
+    assert request.config_lines() == [
+        "Sizing: working-set target (--memory-size)",
+        "Approximate working-set target (bytes): 1,024, 2,048",
+    ]
+
+
+def test_size_request_parses_work_rescale() -> None:
+    args = _build_size_parser().parse_args(
+        ["--memory-size", "2GiB", "--rescale-by-work", "1", "2.5"]
+    )
+    request = _sizing().SizeRequest.from_namespace(args)
+
+    assert request.memory_target_bytes == [2 << 30]
+    assert request.rescale_by_work == [1.0, 2.5]
+    assert request.config_lines() == [
+        "Sizing: working-set target (--memory-size)",
+        f"Approximate working-set target (bytes): {2 << 30:,}",
+        "Work rescale factors: 1.0, 2.5",
+    ]
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_size_request_parser_rejects_invalid_work_rescale(value: str) -> None:
+    parser = _build_size_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rescale-by-work", value])
+
+
+def test_size_request_rejects_programmatic_invalid_work_rescale() -> None:
+    args = SimpleNamespace(rescale_by_work=[0.0])
+    with pytest.raises(RuntimeError, match="positive"):
+        _sizing().SizeRequest.from_namespace(args)
+
+
+def test_size_request_rejects_programmatic_empty_work_rescale() -> None:
+    with pytest.raises(RuntimeError, match="at least one"):
+        _sizing().SizeRequest(exact_size=[1], rescale_by_work=[])
+
+
 def test_size_request_requires_mode_when_default_is_disabled() -> None:
     args = _build_size_parser().parse_args([])
     with pytest.raises(RuntimeError, match="size request must specify"):
@@ -116,10 +163,19 @@ def test_size_request_parser_rejects_conflicting_modes() -> None:
         parser.parse_args(["--size", "32", "--memory-size", "1MiB"])
 
 
+@pytest.mark.parametrize("flag", ["--size", "--memory-size"])
+def test_size_request_parser_rejects_missing_size_values(flag: str) -> None:
+    parser = _build_size_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([flag])
+
+
 def _make_recording_suite(
     *, forbid_resolution: bool = False
 ) -> SimpleNamespace:
     calls: list[tuple[str, tuple[object, ...]]] = []
+    call_records: list[object] = []
     info_names: list[str] = []
     resolutions: list[object] = []
 
@@ -146,18 +202,31 @@ def _make_recording_suite(
         for args in gen:
             calls.append((func.__name__, args))
 
+    def run_timed_calls(planned_calls, **kwargs) -> None:
+        del kwargs
+        utilities = _module("_benchmark.microbenchmark_utilities")
+        for func, group in utilities._group_microbenchmark_calls(
+            planned_calls
+        ):
+            call_records.extend(group)
+            info_names.append(group[0].name)
+            for call in group:
+                calls.append((func.__name__, call.args))
+
     return SimpleNamespace(
         np=np,
         timer=object(),
         runs=1,
         warmup=0,
         calls=calls,
+        call_records=call_records,
         info_names=info_names,
         resolutions=resolutions,
         print_size_resolution=print_size_resolution,
         run_timed=run_timed,
         run_timed_with_info=run_timed_with_info,
         run_timed_with_generator=run_timed_with_generator,
+        run_timed_calls=run_timed_calls,
     )
 
 
@@ -215,19 +284,13 @@ def test_linear_suites_resolve_memory_target_in_run_benchmarks(
     assert call_args[size_index] == [resolution.resolved_size]
 
 
-@pytest.mark.parametrize(
-    ("module_name", "expected_name", "precision"),
-    [("sort_bench", "sort", "all"), ("solve_bench", "solve", "all")],
-)
-def test_non_linear_suites_resolve_memory_target_in_run_benchmarks(
-    module_name: str, expected_name: str, precision: str
-) -> None:
-    module = _module(module_name)
+def test_sort_suite_resolves_memory_target_in_run_benchmarks() -> None:
+    sort_bench = _module("sort_bench")
     suite = _make_recording_suite()
     target_bytes = 1 << 20
     request = _sizing().SizeRequest(memory_target_bytes=[target_bytes])
 
-    module.run_benchmarks(suite, request, variant="all", precision=precision)
+    sort_bench.run_benchmarks(suite, request, variant="all", precision="all")
 
     assert len(suite.resolutions) == 1
     assert len(suite.resolutions[0]) == 1
@@ -236,11 +299,11 @@ def test_non_linear_suites_resolve_memory_target_in_run_benchmarks(
     assert resolution.estimated_working_set_bytes <= target_bytes
     assert suite.calls
     call_name, call_args = suite.calls[0]
-    assert call_name == expected_name
+    assert call_name == "sort"
     assert call_args[2] == [resolution.resolved_size]
 
     def estimate(size: int) -> int:
-        return module._estimate_working_set_bytes("all", precision, size)
+        return sort_bench._estimate_working_set_bytes("all", "all", size)
 
     larger_size = _next_size_with_larger_estimate(
         estimate, resolution.resolved_size
@@ -286,6 +349,7 @@ def test_batched_fft_suite_resolves_memory_target_in_run_benchmarks() -> None:
     assert len(suite.resolutions) == 1
     assert len(suite.resolutions[0]) == 1
     resolution = suite.resolutions[0][0]
+    assert isinstance(resolution, batched_fft.BatchedFFTSizeResolution)
     assert resolution.requested_memory_target_bytes == target_bytes
     panel_lines = resolution.panel_lines()
     assert panel_lines[0] == (
@@ -310,8 +374,86 @@ def test_batched_fft_suite_resolves_memory_target_in_run_benchmarks() -> None:
             <= target_bytes
         )
         assert any(
-            line.startswith(f"{case.name}: ") for line in panel_lines[1:]
+            line.startswith(f"{case.name} work_scale=1: ")
+            and f"effective_target={target_bytes:,} bytes" in line
+            for line in panel_lines[1:]
         )
+
+
+def test_batched_fft_memory_target_work_rescale_uses_effective_target() -> (
+    None
+):
+    batched_fft = _module("batched_fft_bench")
+    suite = _make_recording_suite()
+    target_bytes = 64 << 10
+    request = _sizing().SizeRequest(
+        memory_target_bytes=[target_bytes], rescale_by_work=[1024.0, 262144.0]
+    )
+
+    batched_fft.run_benchmarks(suite, request)
+
+    assert len(suite.resolutions) == 1
+    assert len(suite.resolutions[0]) == 1
+    panel_lines = suite.resolutions[0][0].panel_lines()
+    assert len(panel_lines) == 2 * len(batched_fft._CASES) + 1
+
+    expected_batches = {
+        "1d": [16, 4096],
+        "2d": [16, 4096],
+        "3d": [16, 4096],
+        "2d_double": [8, 2048],
+    }
+    for case_index, case in enumerate(batched_fft._CASES):
+        first_args = suite.calls[2 * case_index][1]
+        second_args = suite.calls[2 * case_index + 1][1]
+        assert [first_args[3], second_args[3]] == expected_batches[case.name]
+        assert any(
+            line.startswith(f"{case.name} work_scale=262144: ")
+            and "effective_target=17,179,869,184 bytes" in line
+            for line in panel_lines[1:]
+        )
+
+
+def test_batched_fft_effective_target_equality_does_not_warn() -> None:
+    batched_fft = _module("batched_fft_bench")
+    suite = _make_recording_suite()
+    target_bytes = 64 << 10
+    request = _sizing().SizeRequest(
+        memory_target_bytes=[target_bytes], rescale_by_work=[128.0]
+    )
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        batched_fft.run_benchmarks(suite, request)
+
+    assert not recorded
+    for case_index, case in enumerate(batched_fft._CASES):
+        args = suite.calls[case_index][1]
+        expected_batch = 2 if case.dtype_name == "complex64" else 1
+        assert args[3] == expected_batch
+
+
+def test_batched_fft_effective_target_equality_uses_strict_warning() -> None:
+    batched_fft = _module("batched_fft_bench")
+    suite = _make_recording_suite()
+    target_bytes = 64 << 10
+    request = _sizing().SizeRequest(
+        memory_target_bytes=[target_bytes], rescale_by_work=[64.0]
+    )
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        batched_fft.run_benchmarks(suite, request)
+
+    assert len(recorded) == 1
+    message = str(recorded[0].message)
+    assert "2d_double work_scale=64=" in message
+    assert "1d work_scale=64=" not in message
+    assert "2d work_scale=64=" not in message
+    assert "3d work_scale=64=" not in message
+    for case_index in range(len(batched_fft._CASES)):
+        args = suite.calls[case_index][1]
+        assert args[3] == 1
 
 
 def test_batched_fft_exact_size_scales_only_the_batch_dimension() -> None:
@@ -333,6 +475,260 @@ def test_batched_fft_exact_size_scales_only_the_batch_dimension() -> None:
         assert call_args[2] == case.dtype_name
         assert call_args[3] == 3
         assert call_args[4] == case.extent
+
+
+def test_solve_suite_plans_scalar_cases_with_work_rescale() -> None:
+    solve_bench = _module("solve_bench")
+    suite = _make_recording_suite(forbid_resolution=True)
+    request = _sizing().SizeRequest(
+        exact_size=[64], rescale_by_work=[1.0, 8.0]
+    )
+
+    solve_bench.run_benchmarks(
+        suite, request, variant="solve-1-rhs", precision="32"
+    )
+
+    assert suite.info_names == ["solve"]
+    assert len(suite.calls) == 2
+    sizes = [call_args[2] for _, call_args in suite.calls]
+    # size=64 gives n=8 and work=576; 8x work lands at size=256.
+    assert sizes == [64, 256]
+    assert [call.case_id for call in suite.call_records] == [
+        "solve.solve-1-rhs.float32",
+        "solve.solve-1-rhs.float32",
+    ]
+
+
+def test_solve_suite_exact_size_uses_literal_base_per_case() -> None:
+    solve_bench = _module("solve_bench")
+    suite = _make_recording_suite(forbid_resolution=True)
+    sizing = _sizing()
+    request = sizing.SizeRequest(exact_size=[64], rescale_by_work=[1.0, 8.0])
+
+    solve_bench.run_benchmarks(suite, request, variant="all", precision="32")
+
+    variants = solve_bench._get_variants("all")
+    assert suite.info_names == ["solve"]
+    assert len(suite.calls) == 2 * len(variants)
+    for case_index, case_name in enumerate(variants):
+        first_record = suite.call_records[2 * case_index]
+        second_record = suite.call_records[2 * case_index + 1]
+        expected_sizes = sizing.rescale_sizes_by_work(
+            request,
+            [64],
+            estimate_work=lambda size, case_name=case_name: (
+                solve_bench._estimate_case_work(case_name, size)
+            ),
+        )
+        assert [first_record.args[2], second_record.args[2]] == expected_sizes
+        assert first_record.args[1] == case_name
+        assert first_record.case_id == f"solve.{case_name}.float32"
+
+
+def test_solve_suite_resolves_memory_target_per_case() -> None:
+    solve_bench = _module("solve_bench")
+    suite = _make_recording_suite()
+    sizing = _sizing()
+    target_bytes = 1 << 20
+    request = sizing.SizeRequest(
+        memory_target_bytes=[target_bytes], rescale_by_work=[1.0, 4.0]
+    )
+
+    solve_bench.run_benchmarks(suite, request, variant="all", precision="32")
+
+    variants = solve_bench._get_variants("all")
+    assert suite.info_names == ["solve"]
+    assert len(suite.calls) == 2 * len(variants)
+    assert len(suite.resolutions) == 1
+    assert len(suite.resolutions[0]) == len(variants)
+
+    base_sizes = []
+    for case_index, case_name in enumerate(variants):
+        expected_base = solve_bench._resolve_case_size_from_memory_target(
+            case_name, "float32", target_bytes
+        )
+        expected_sizes = sizing.rescale_sizes_by_work(
+            request,
+            [expected_base],
+            estimate_work=lambda size, case_name=case_name: (
+                solve_bench._estimate_case_work(case_name, size)
+            ),
+        )
+        first_record = suite.call_records[2 * case_index]
+        second_record = suite.call_records[2 * case_index + 1]
+        assert [first_record.args[2], second_record.args[2]] == expected_sizes
+        assert first_record.args[1] == case_name
+        assert (
+            solve_bench._estimate_case_working_set_bytes(
+                case_name, "float32", expected_base
+            )
+            <= target_bytes
+        )
+        assert first_record.case_id == f"solve.{case_name}.float32"
+        panel_lines = suite.resolutions[0][case_index].panel_lines()
+        assert f"case: solve.{case_name}.float32" in panel_lines
+        base_sizes.append(expected_base)
+
+    assert len(set(base_sizes)) > 1
+
+
+def test_gemm_gemv_suite_plans_named_cases_with_work_rescale() -> None:
+    gemm_gemv = _module("gemm_gemv_bench")
+    suite = _make_recording_suite(forbid_resolution=True)
+    sizing = _sizing()
+    request = sizing.SizeRequest(exact_size=[64], rescale_by_work=[1.0, 4.0])
+
+    gemm_gemv.run_benchmarks(
+        suite, request, variant="all", precision="32", perform_check=False
+    )
+
+    assert suite.info_names == ["skinny_gemm", "square_gemm", "gemv"]
+    assert len(suite.calls) == 6
+    for case_index, case_name in enumerate(suite.info_names):
+        first_args = suite.calls[2 * case_index][1]
+        second_args = suite.calls[2 * case_index + 1][1]
+        expected_sizes = sizing.rescale_sizes_by_work(
+            request,
+            [64],
+            estimate_work=lambda size, case_name=case_name: (
+                gemm_gemv._estimate_case_work(case_name, size)
+            ),
+        )
+        assert [first_args[1], second_args[1]] == expected_sizes
+        assert suite.call_records[2 * case_index].case_id == (
+            f"gemm_gemv.{case_name}.float32"
+        )
+
+
+def test_gemm_gemv_suite_resolves_memory_target_per_case() -> None:
+    gemm_gemv = _module("gemm_gemv_bench")
+    suite = _make_recording_suite()
+    sizing = _sizing()
+    target_bytes = 1 << 20
+    request = sizing.SizeRequest(
+        memory_target_bytes=[target_bytes], rescale_by_work=[1.0, 4.0]
+    )
+
+    gemm_gemv.run_benchmarks(
+        suite, request, variant="all", precision="32", perform_check=False
+    )
+
+    assert suite.info_names == ["skinny_gemm", "square_gemm", "gemv"]
+    assert len(suite.calls) == 6
+    assert len(suite.resolutions) == 1
+    assert len(suite.resolutions[0]) == 3
+
+    base_sizes = []
+    for case_index, case_name in enumerate(suite.info_names):
+        expected_base = gemm_gemv._resolve_case_size_from_memory_target(
+            case_name, "float32", target_bytes
+        )
+        expected_sizes = sizing.rescale_sizes_by_work(
+            request,
+            [expected_base],
+            estimate_work=lambda size, case_name=case_name: (
+                gemm_gemv._estimate_case_work(case_name, size)
+            ),
+        )
+        first_args = suite.calls[2 * case_index][1]
+        second_args = suite.calls[2 * case_index + 1][1]
+        assert [first_args[1], second_args[1]] == expected_sizes
+        assert (
+            gemm_gemv._estimate_case_working_set_bytes(
+                case_name, "float32", expected_base
+            )
+            <= target_bytes
+        )
+        assert suite.call_records[2 * case_index].case_id == (
+            f"gemm_gemv.{case_name}.float32"
+        )
+        panel_lines = suite.resolutions[0][case_index].panel_lines()
+        assert f"case: gemm_gemv.{case_name}.float32" in panel_lines
+        base_sizes.append(expected_base)
+
+    assert len(set(base_sizes)) > 1
+
+
+def test_axis_sum_suite_plans_generated_cases_with_work_rescale() -> None:
+    axis_sum = _module("axis_sum_bench")
+    suite = _make_recording_suite(forbid_resolution=True)
+    request = _sizing().SizeRequest(
+        exact_size=[100], rescale_by_work=[1.0, 2.0]
+    )
+
+    axis_sum.run_benchmarks(suite, request, case="all", perform_check=False)
+
+    assert suite.info_names == [*axis_sum._CASES]
+    assert len(suite.calls) == 2 * len(axis_sum._CASES)
+    for case_index, case_name in enumerate(axis_sum._CASES):
+        first_args = suite.calls[2 * case_index][1]
+        second_args = suite.calls[2 * case_index + 1][1]
+        assert first_args[1] == case_name
+        assert first_args[6] == 100
+        assert second_args[6] > first_args[6]
+        assert suite.call_records[2 * case_index].case_id == (
+            f"axis_sum.{case_name}"
+        )
+
+
+def test_batched_fft_suite_plans_per_case_batches_with_work_rescale() -> None:
+    batched_fft = _module("batched_fft_bench")
+    suite = _make_recording_suite(forbid_resolution=True)
+    request = _sizing().SizeRequest(
+        exact_size=[2 * batched_fft._SHARED_TRANSFORM_VOLUME],
+        rescale_by_work=[1.0, 2.0],
+    )
+
+    batched_fft.run_benchmarks(suite, request)
+
+    assert suite.info_names == [case.name for case in batched_fft._CASES]
+    assert len(suite.calls) == 2 * len(batched_fft._CASES)
+    for case_index, case in enumerate(batched_fft._CASES):
+        first_args = suite.calls[2 * case_index][1]
+        second_args = suite.calls[2 * case_index + 1][1]
+        assert first_args[1] == case.dims
+        assert first_args[2] == case.dtype_name
+        assert [first_args[3], second_args[3]] == [2, 4]
+        assert suite.call_records[2 * case_index].case_id == (
+            f"batched_fft.{case.name}"
+        )
+
+
+def test_stream_suite_supports_work_rescale() -> None:
+    stream_bench = _module("stream_bench")
+    suite = _make_recording_suite(forbid_resolution=True)
+    request = _sizing().SizeRequest(
+        exact_size=[100], rescale_by_work=[1.0, 2.0]
+    )
+
+    stream_bench.run_benchmarks(
+        suite,
+        request,
+        operation="copy",
+        precision="32",
+        contiguous="true",
+        perform_check=False,
+    )
+
+    assert suite.calls
+    assert suite.calls[0][1][4] == [100, 200]
+
+
+def test_sort_suite_supports_work_rescale() -> None:
+    sort_bench = _module("sort_bench")
+    suite = _make_recording_suite(forbid_resolution=True)
+    request = _sizing().SizeRequest(
+        exact_size=[100], rescale_by_work=[1.0, 2.0]
+    )
+
+    sort_bench.run_benchmarks(
+        suite, request, variant="sort-1D", precision="32"
+    )
+
+    assert suite.calls
+    sizes = suite.calls[0][1][2]
+    assert sizes[0] == 100
+    assert sizes[1] > sizes[0]
 
 
 def test_resolve_linear_suite_size_reports_resolution_details() -> None:
@@ -366,6 +762,102 @@ def test_resolve_size_by_binary_search_finds_largest_fitting_size() -> None:
         estimate,
         target_bytes=1_000,
     )
+
+
+def test_resolve_suite_size_rescales_exact_size_by_work() -> None:
+    sizing = _sizing()
+    request = sizing.SizeRequest(
+        exact_size=[100], rescale_by_work=[1.0, 4.0, 0.25]
+    )
+
+    sizes, resolutions = sizing.resolve_suite_size(
+        request,
+        resolve_from_target=lambda target_bytes: target_bytes,
+        estimate_working_set_bytes=lambda size: size,
+        estimate_work=lambda size: size * size,
+    )
+
+    assert sizes == [100, 200, 50]
+    assert resolutions is None
+
+
+def test_resolve_suite_size_rescales_each_memory_target_by_work() -> None:
+    sizing = _sizing()
+    request = sizing.SizeRequest(
+        memory_target_bytes=[10, 20], rescale_by_work=[1.0, 2.0]
+    )
+
+    sizes, resolutions = sizing.resolve_suite_size(
+        request,
+        resolve_from_target=lambda target_bytes: target_bytes,
+        estimate_working_set_bytes=lambda size: size,
+        estimate_work=lambda size: size,
+    )
+
+    assert sizes == [10, 20, 20, 40]
+    assert resolutions is not None
+    assert [r.resolved_size for r in resolutions] == [10, 20]
+    assert [r.requested_memory_target_bytes for r in resolutions] == [10, 20]
+    assert resolutions[0].panel_lines()[-3:] == [
+        "work-rescaled sizes:",
+        "work_scale=1: resolved_size=10",
+        "work_scale=2: resolved_size=20",
+    ]
+
+
+def test_resolve_suite_size_rejects_rescale_without_work_estimate() -> None:
+    sizing = _sizing()
+    request = sizing.SizeRequest(exact_size=[100], rescale_by_work=[1.0, 2.0])
+
+    with pytest.raises(RuntimeError, match="work rescaling"):
+        sizing.resolve_suite_size(
+            request,
+            resolve_from_target=lambda target_bytes: target_bytes,
+            estimate_working_set_bytes=lambda size: size,
+        )
+
+
+def test_resolve_suite_size_warns_when_work_rescale_clamps_to_minimum() -> (
+    None
+):
+    sizing = _sizing()
+    request = sizing.SizeRequest(exact_size=[1], rescale_by_work=[0.25])
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="work target is smaller than minimum estimated work",
+    ):
+        sizes, resolutions = sizing.resolve_suite_size(
+            request,
+            resolve_from_target=lambda target_bytes: target_bytes,
+            estimate_working_set_bytes=lambda size: size,
+            estimate_work=lambda size: size + 10,
+        )
+
+    assert sizes == [1]
+    assert resolutions is None
+
+
+def test_resolve_suite_size_warns_before_rescaling_undersized_target() -> None:
+    sizing = _sizing()
+    request = sizing.SizeRequest(
+        memory_target_bytes=[1], rescale_by_work=[1.0, 2.0]
+    )
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="memory target is smaller than estimated working set",
+    ):
+        sizes, resolutions = sizing.resolve_suite_size(
+            request,
+            resolve_from_target=lambda target_bytes: target_bytes,
+            estimate_working_set_bytes=lambda size: 10 * size,
+            estimate_work=lambda size: size,
+        )
+
+    assert sizes == [1, 2]
+    assert resolutions is not None
+    assert resolutions[0].estimated_working_set_bytes == 10
 
 
 def test_stream_target_resolution_for_noncontiguous_layout() -> None:
@@ -467,15 +959,61 @@ def test_stream_check_uses_pre_op_snapshots(monkeypatch) -> None:
         )
 
 
-def test_gemm_target_resolution_for_all_variants() -> None:
+@pytest.mark.parametrize(
+    ("variant", "dtype"),
+    [
+        ("skinny_gemm", "float32"),
+        ("skinny_gemm", "float64"),
+        ("square_gemm", "float32"),
+        ("square_gemm", "float64"),
+        ("gemv", "float32"),
+        ("gemv", "float64"),
+    ],
+)
+def test_gemm_target_resolution_for_each_case(
+    variant: str, dtype: str
+) -> None:
     gemm_gemv = _module("gemm_gemv_bench")
 
     def estimate(size: int) -> int:
-        return gemm_gemv._estimate_working_set_bytes("all", "all", size)
+        return gemm_gemv._estimate_case_working_set_bytes(variant, dtype, size)
 
     _assert_target_resolution(
-        lambda target_bytes: gemm_gemv._resolve_size_from_memory_target(
-            "all", "all", target_bytes
+        lambda target_bytes: (
+            gemm_gemv._resolve_case_size_from_memory_target(
+                variant, dtype, target_bytes
+            )
+        ),
+        estimate,
+        target_bytes=8 << 20,
+    )
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "solve-1-rhs",
+        "solve-n-rhs",
+        "batched-solve-1-rhs",
+        "batched-solve-n-rhs",
+    ],
+)
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_solve_target_resolution_for_each_case(
+    variant: str, dtype: str
+) -> None:
+    solve_bench = _module("solve_bench")
+
+    def estimate(size: int) -> int:
+        return solve_bench._estimate_case_working_set_bytes(
+            variant, dtype, size
+        )
+
+    _assert_target_resolution(
+        lambda target_bytes: (
+            solve_bench._resolve_case_size_from_memory_target(
+                variant, dtype, target_bytes
+            )
         ),
         estimate,
         target_bytes=8 << 20,
@@ -508,7 +1046,9 @@ def test_undersized_stream_target_raises() -> None:
 def test_batched_fft_undersized_target_warns() -> None:
     batched_fft = _module("batched_fft_bench")
     suite = _make_recording_suite()
-    request = _sizing().SizeRequest(memory_target_bytes=[100])
+    request = _sizing().SizeRequest(
+        memory_target_bytes=[100], rescale_by_work=[1.0, 2.0]
+    )
 
     with pytest.warns(
         RuntimeWarning,
@@ -519,7 +1059,21 @@ def test_batched_fft_undersized_target_warns() -> None:
 
     assert len(suite.resolutions) == 1
     assert len(suite.resolutions[0]) == 1
-    assert len(suite.calls) == len(batched_fft._CASES)
+    panel_lines = suite.resolutions[0][0].panel_lines()
+    assert (
+        "1d work_scale=1: effective_target=100 bytes, batch=1, "
+        in (panel_lines[1])
+    )
+    assert (
+        "1d work_scale=2: effective_target=200 bytes, batch=1, "
+        in (panel_lines[2])
+    )
+    assert len(suite.calls) == 2 * len(batched_fft._CASES)
+    for case_index, case in enumerate(batched_fft._CASES):
+        first_args = suite.calls[2 * case_index][1]
+        second_args = suite.calls[2 * case_index + 1][1]
+        assert first_args[1] == case.dims
+        assert [first_args[3], second_args[3]] == [1, 1]
 
 
 def test_fast_advanced_indexing_uses_square_size_for_2d_cases() -> None:
@@ -577,7 +1131,7 @@ def test_axis_sum_normalizes_negative_axes_for_output_shape() -> None:
     assert axis_sum._normalized_axes((0, -1), 3) == (0, 2)
 
 
-def test_main_dispatches_memory_target_request(mocker) -> None:
+def test_main_dispatches_memory_target_request(monkeypatch) -> None:
     main = _module("main")
     requests = []
 
@@ -610,11 +1164,15 @@ def test_main_dispatches_memory_target_request(mocker) -> None:
         warmup=0,
         print_panel=lambda *args, **kwargs: None,
     )
-    mocker.patch.object(main.MicrobenchmarkConfig, "add_parser_group")
-    mocker.patch.object(
-        main.MicrobenchmarkConfig, "from_args", return_value=config
+    monkeypatch.setattr(
+        main.MicrobenchmarkConfig,
+        "add_parser_group",
+        lambda parser, name: None,
     )
-    mocker.patch.object(main, "SUITE_CLASSES", [FakeSuite])
+    monkeypatch.setattr(
+        main.MicrobenchmarkConfig, "from_args", lambda args: config
+    )
+    monkeypatch.setattr(main, "SUITE_CLASSES", [FakeSuite])
 
     assert main.main(["--suite", "fake", "--memory-size", "64MiB"]) == 0
     assert len(requests) == 1

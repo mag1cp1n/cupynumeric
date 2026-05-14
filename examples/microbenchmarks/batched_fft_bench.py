@@ -24,18 +24,19 @@ dimension from ``--size`` or ``--memory-size``.
 
 from __future__ import annotations
 
+import math
 import warnings
 
 from dataclasses import dataclass
 
 from _benchmark import (
+    MicrobenchmarkCall,
     MicrobenchmarkSuite,
     benchmark_info,
-    get_benchmark_info,
     timed_loop,
 )
 from _benchmark.harness import ArrayPackage
-from _benchmark.sizing import SizeRequest
+from _benchmark.sizing import SizeRequest, rescale_sizes_by_work
 
 RAND_SCALE_FACTOR = 100
 
@@ -97,15 +98,29 @@ def _estimate_case_working_set_bytes(case: FFTCase, batch: int) -> int:
     return 2 * batch * case.transform_volume * case.itemsize
 
 
+def _estimate_case_work(case: FFTCase, batch: int) -> float:
+    return batch * case.transform_volume * math.log2(case.transform_volume)
+
+
 def _resolve_batch_from_memory_target(target_bytes: int, case: FFTCase) -> int:
     return max(1, target_bytes // _estimate_case_working_set_bytes(case, 1))
 
 
-def _describe_case(case: FFTCase, batch: int) -> str:
+def _effective_memory_target_bytes(
+    target_bytes: int, work_scale: float
+) -> int:
+    return int(target_bytes * work_scale)
+
+
+def _describe_work_scaled_case(
+    case: FFTCase, work_scale: float, effective_target_bytes: int, batch: int
+) -> str:
     shape = " x ".join(str(extent) for extent in _case_shape(case, batch))
     estimated = _estimate_case_working_set_bytes(case, batch)
     return (
-        f"{case.name}: batch={batch:,}, shape={shape}, "
+        f"{case.name} work_scale={work_scale:g}: "
+        f"effective_target={effective_target_bytes:,} bytes, "
+        f"batch={batch:,}, shape={shape}, "
         f"dtype={case.dtype_name}, "
         f"estimated_working_set={estimated:,} bytes"
     )
@@ -117,10 +132,16 @@ def _resolve_case_batches(
     if size_request.exact_size is not None:
         return (
             {
-                case: [
-                    _resolve_batch_from_size(size, case)
-                    for size in size_request.exact_size
-                ]
+                case: rescale_sizes_by_work(
+                    size_request,
+                    (
+                        _resolve_batch_from_size(size, case)
+                        for size in size_request.exact_size
+                    ),
+                    estimate_work=lambda batch, case=case: (
+                        _estimate_case_work(case, batch)
+                    ),
+                )
                 for case in _CASES
             },
             None,
@@ -133,12 +154,25 @@ def _resolve_case_batches(
         detail_lines = []
         oversized = []
         for case in _CASES:
-            batch = _resolve_batch_from_memory_target(target_bytes, case)
-            batches[case].append(batch)
-            detail_lines.append(_describe_case(case, batch))
-            estimated = _estimate_case_working_set_bytes(case, batch)
-            if estimated > target_bytes:
-                oversized.append(f"{case.name}={estimated:,} bytes")
+            for work_scale in size_request.rescale_by_work:
+                effective_target = _effective_memory_target_bytes(
+                    target_bytes, work_scale
+                )
+                batch = _resolve_batch_from_memory_target(
+                    effective_target, case
+                )
+                batches[case].append(batch)
+                detail_lines.append(
+                    _describe_work_scaled_case(
+                        case, work_scale, effective_target, batch
+                    )
+                )
+                estimated = _estimate_case_working_set_bytes(case, batch)
+                if estimated > effective_target:
+                    oversized.append(
+                        f"{case.name} work_scale={work_scale:g}="
+                        f"{estimated:,} bytes"
+                    )
         if oversized:
             warnings.warn(
                 "memory target is smaller than estimated working set for "
@@ -192,27 +226,26 @@ def run_benchmarks(suite, size_request: SizeRequest):
     if resolutions is not None:
         suite.print_size_resolution(resolutions)
 
-    base_info = get_benchmark_info(batched_fft)
-
-    def arg_gen(case: FFTCase):
-        for batch in case_batches[case]:
-            yield (
-                np,
-                case.dims,
-                case.dtype_name,
-                batch,
-                case.extent,
-                runs,
-                warmup,
-            )
-
+    calls = []
     for case in _CASES:
-        suite.run_timed_with_generator(
-            base_info.replace(name=case.name),
-            batched_fft,
-            arg_gen(case),
-            timer=timer,
-        )
+        for batch in case_batches[case]:
+            calls.append(
+                MicrobenchmarkCall(
+                    case_id=f"batched_fft.{case.name}",
+                    name=case.name,
+                    function=batched_fft,
+                    args=(
+                        np,
+                        case.dims,
+                        case.dtype_name,
+                        batch,
+                        case.extent,
+                        runs,
+                        warmup,
+                    ),
+                )
+            )
+    suite.run_timed_calls(calls, timer=timer)
 
 
 class BatchedFFTSuite(MicrobenchmarkSuite):

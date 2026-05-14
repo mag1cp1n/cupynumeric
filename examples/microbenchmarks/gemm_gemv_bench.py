@@ -31,7 +31,12 @@ import math
 
 import numpy as host_np
 
-from _benchmark import MicrobenchmarkSuite, benchmark_info, timed_loop
+from _benchmark import (
+    MicrobenchmarkCall,
+    MicrobenchmarkSuite,
+    benchmark_info,
+    timed_loop,
+)
 from _benchmark.sizing import (
     SizeRequest,
     resolve_size_by_binary_search,
@@ -78,66 +83,71 @@ def _get_case_dimensions(variant, size):
 
 
 def _estimate_case_working_set_bytes(variant, dtype, size):
-    # NB: we are actually returning a scaled version of flops,
-    # because we are using --memory-size to scale work
-
     dimensions = _get_case_dimensions(variant, size)
     itemsize = _dtype_bytes(dtype)
-    factor = 0.001
 
     if variant == "skinny_gemm":
         m = dimensions["m"]
         n = dimensions["n"]
         k = dimensions["k"]
-        return int(itemsize * (2 * m * k * n) * factor)
+        return itemsize * (m * k + k * n + m * n)
 
     n = dimensions["n"]
     if variant == "square_gemm":
-        return int(itemsize * 2 * n * n * n * factor)
+        return itemsize * 3 * n * n
 
     # gemv
-    return int(itemsize * 2 * n * n * factor)
+    return itemsize * (n * n + 2 * n)
 
 
-def _estimate_working_set_bytes(variant, precision, size):
-    variants = _get_variants(variant)
-    dtypes = _get_dtypes(precision)
-    return max(
-        _estimate_case_working_set_bytes(case, dtype, size)
-        for case in variants
-        for dtype in dtypes
-    )
+def _estimate_case_work(variant, size):
+    dimensions = _get_case_dimensions(variant, size)
+    if variant == "skinny_gemm":
+        return 2 * dimensions["m"] * dimensions["k"] * dimensions["n"]
+    n = dimensions["n"]
+    if variant == "square_gemm":
+        return 2 * n * n * n
+    return 2 * n * n
 
 
-def _resolve_size_from_memory_target(variant, precision, target_bytes):
+def _resolve_case_size_from_memory_target(variant, dtype, target_bytes):
     return resolve_size_by_binary_search(
         target_bytes,
-        estimate_working_set_bytes=lambda size: _estimate_working_set_bytes(
-            variant, precision, size
+        estimate_working_set_bytes=lambda size: (
+            _estimate_case_working_set_bytes(variant, dtype, size)
         ),
         initial_guess=8,
     )
 
 
-def _describe_size(variant, precision, size):
-    variants = _get_variants(variant)
-    dtypes = _get_dtypes(precision)
-    lines = [
-        f"variants: {', '.join(variants)}",
-        f"dtypes:   {', '.join(dtypes)}",
-    ]
-    for case in variants:
-        dimensions = _get_case_dimensions(case, size)
-        if case in {"skinny_gemm", "square_gemm"}:
-            lines.append(
-                f"{case}: "
-                f"m={dimensions['m']}, "
-                f"n={dimensions['n']}, "
-                f"k={dimensions['k']}"
-            )
-        else:
-            lines.append(f"gemv: m={dimensions['m']}, n={dimensions['n']}")
+def _describe_case_size(variant, dtype, size):
+    dimensions = _get_case_dimensions(variant, size)
+    lines = [f"case: gemm_gemv.{variant}.{dtype}"]
+    if variant in {"skinny_gemm", "square_gemm"}:
+        lines.append(
+            f"{variant}: "
+            f"m={dimensions['m']}, "
+            f"n={dimensions['n']}, "
+            f"k={dimensions['k']}"
+        )
+    else:
+        lines.append(f"gemv: m={dimensions['m']}, n={dimensions['n']}")
     return lines
+
+
+def _resolve_case_sizes(size_request, variant, dtype):
+    sizes, resolutions = resolve_suite_size(
+        size_request,
+        resolve_from_target=lambda target_bytes: (
+            _resolve_case_size_from_memory_target(variant, dtype, target_bytes)
+        ),
+        estimate_working_set_bytes=lambda size: (
+            _estimate_case_working_set_bytes(variant, dtype, size)
+        ),
+        estimate_work=lambda size: _estimate_case_work(variant, size),
+        describe_size=lambda size: _describe_case_size(variant, dtype, size),
+    )
+    return sizes, tuple(resolutions or ())
 
 
 def _initialize_case(array_module, variant, size, dtype):
@@ -255,36 +265,36 @@ def run_benchmarks(suite, size_request, variant, precision, perform_check):
     timer = suite.timer
     runs = suite.runs
     warmup = suite.warmup
-    sizes, resolutions = resolve_suite_size(
-        size_request,
-        resolve_from_target=lambda target_bytes: (
-            _resolve_size_from_memory_target(variant, precision, target_bytes)
-        ),
-        estimate_working_set_bytes=lambda resolved_size: (
-            _estimate_working_set_bytes(variant, precision, resolved_size)
-        ),
-        describe_size=lambda resolved_size: _describe_size(
-            variant, precision, resolved_size
-        ),
-    )
-    if resolutions is not None:
-        suite.print_size_resolution(resolutions)
 
     variants = _get_variants(variant)
     dtypes = _get_dtypes(precision)
-    funcs = [skinny_gemm, square_gemm, gemv]
-    for func in funcs:
-        if func.__name__ in variants:
-            suite.run_timed(
-                func,
-                np,
-                sizes,
-                runs,
-                warmup,
-                dtypes,
-                timer=timer,
-                perform_check=perform_check,
+    funcs = {
+        "skinny_gemm": skinny_gemm,
+        "square_gemm": square_gemm,
+        "gemv": gemv,
+    }
+    calls = []
+    resolutions = []
+    for case in variants:
+        func = funcs[case]
+        for dtype in dtypes:
+            sizes, case_resolutions = _resolve_case_sizes(
+                size_request, case, dtype
             )
+            resolutions.extend(case_resolutions)
+            calls.extend(
+                MicrobenchmarkCall(
+                    case_id=f"gemm_gemv.{case}.{dtype}",
+                    name=case,
+                    function=func,
+                    args=(np, size, runs, warmup, dtype),
+                )
+                for size in sizes
+            )
+
+    if resolutions:
+        suite.print_size_resolution(resolutions)
+    suite.run_timed_calls(calls, timer=timer, perform_check=perform_check)
 
 
 class GemmSuite(MicrobenchmarkSuite):

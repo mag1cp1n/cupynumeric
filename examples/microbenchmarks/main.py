@@ -27,7 +27,7 @@ Examples:
     # Large problem size
     python main.py --suite advanced_indexing --size 100000000
 
-    # Heuristic size selection from a memory target
+    # Working-set size selection from a memory target
     python main.py --suite all --memory-size 75GiB
 
     # Multi-GPU

@@ -194,6 +194,7 @@ def run_benchmarks(
         estimate_working_set_bytes=lambda resolved_size: (
             _estimate_working_set_bytes(precision, resolved_size)
         ),
+        estimate_work=lambda resolved_size: resolved_size,
         describe_size=lambda resolved_size: _describe_size(
             resolved_size, precision, contiguous
         ),

@@ -107,6 +107,18 @@ def _estimate_working_set_bytes(variant, precision, size):
     )
 
 
+def _estimate_case_work(variant, size):
+    shape = _get_case_dimension(variant, size)["size"]
+    return math.prod(shape) * math.log2(max(2, shape[-1]))
+
+
+def _estimate_work(variant, size):
+    # Use the worst selected variant so the rescaled size fits every case.
+    return max(
+        _estimate_case_work(case, size) for case in _get_variants(variant)
+    )
+
+
 def _resolve_size_from_memory_target(variant, precision, target_bytes):
     return resolve_size_by_binary_search(
         target_bytes,
@@ -173,6 +185,9 @@ def run_benchmarks(suite, size_request, *, variant="all", precision="32"):
         ),
         estimate_working_set_bytes=lambda resolved_size: (
             _estimate_working_set_bytes(variant, precision, resolved_size)
+        ),
+        estimate_work=lambda resolved_size: (
+            _estimate_work(variant, resolved_size)
         ),
         describe_size=lambda resolved_size: _describe_size(
             resolved_size, variant, precision

@@ -32,7 +32,12 @@ from __future__ import annotations
 
 import math
 
-from _benchmark import MicrobenchmarkSuite, benchmark_info, timed_loop
+from _benchmark import (
+    MicrobenchmarkCall,
+    MicrobenchmarkSuite,
+    benchmark_info,
+    timed_loop,
+)
 from _benchmark.sizing import (
     SizeRequest,
     resolve_size_by_binary_search,
@@ -65,11 +70,6 @@ def _dtype_bytes(dtype) -> int:
     return numpy.dtype(dtype).itemsize
 
 
-def _initial_bytes_per_size(precision) -> int:
-    # Seed the search with a cheap upper-bound guess before the full estimate.
-    return 8 + max(_dtype_bytes(d) for d in _get_dtypes(precision))
-
-
 def _get_case_dimensions(variant, size):
     dimensions = {}
     if variant.startswith("solve"):
@@ -97,18 +97,21 @@ def _get_case_dimensions(variant, size):
 
 
 def _estimate_case_working_set_bytes(variant, dtype, size):
-    # NB: we are actually returning a scaled version of flops,
-    # because we are using --memory-size to scale work
-
     dimensions = _get_case_dimensions(variant, size)
     matrix_dims = dimensions["matrix_size"]
     rhs_dims = dimensions["rhs_size"]
     dtype_bytes = _dtype_bytes(dtype)
-    factor = 0.001
+    matrix_elements = math.prod(matrix_dims)
+    rhs_elements = math.prod(rhs_dims)
+    return dtype_bytes * (matrix_elements + 2 * rhs_elements)
 
+
+def _estimate_case_work(variant, size):
+    dimensions = _get_case_dimensions(variant, size)
+    matrix_dims = dimensions["matrix_size"]
+    rhs_dims = dimensions["rhs_size"]
     n = matrix_dims[-1]
     k = rhs_dims[-1]
-
     if variant.startswith("solve"):
         b = 1
         if variant.endswith("-1-rhs"):
@@ -118,38 +121,42 @@ def _estimate_case_working_set_bytes(variant, dtype, size):
         if variant.endswith("-1-rhs"):
             k = 1
 
-    return int(dtype_bytes * b * (n * n * n + n * n * k) * factor)
+    return b * (n * n * n + n * n * k)
 
 
-def _estimate_working_set_bytes(variant, precision, size):
-    return max(
-        _estimate_case_working_set_bytes(case, dtype, size)
-        for case in _get_variants(variant)
-        for dtype in _get_dtypes(precision)
-    )
-
-
-def _resolve_size_from_memory_target(variant, precision, target_bytes):
+def _resolve_case_size_from_memory_target(variant, dtype, target_bytes):
     return resolve_size_by_binary_search(
         target_bytes,
-        estimate_working_set_bytes=lambda size: _estimate_working_set_bytes(
-            variant, precision, size
+        estimate_working_set_bytes=lambda size: (
+            _estimate_case_working_set_bytes(variant, dtype, size)
         ),
         initial_guess=8,
     )
 
 
-def _describe_size(size, variant, precision):
-    lines = [
-        f"variants: {', '.join(_get_variants(variant))}",
-        f"dtypes:   {', '.join(_get_dtypes(precision))}",
+def _describe_case_size(size, variant, dtype):
+    dimensions = _get_case_dimensions(variant, size)
+    matrix_size = " x ".join(str(dim) for dim in dimensions["matrix_size"])
+    rhs_size = " x ".join(str(dim) for dim in dimensions["rhs_size"])
+    return [
+        f"case: solve.{variant}.{dtype}",
+        f"{variant}: matrix={matrix_size}, rhs={rhs_size}",
     ]
-    for case in _get_variants(variant):
-        dimensions = _get_case_dimensions(case, size)
-        matrix_size = " x ".join(str(dim) for dim in dimensions["matrix_size"])
-        rhs_size = " x ".join(str(dim) for dim in dimensions["rhs_size"])
-        lines.append(f"{case}: matrix={matrix_size}, rhs={rhs_size}")
-    return lines
+
+
+def _resolve_case_sizes(size_request, variant, dtype):
+    sizes, resolutions = resolve_suite_size(
+        size_request,
+        resolve_from_target=lambda target_bytes: (
+            _resolve_case_size_from_memory_target(variant, dtype, target_bytes)
+        ),
+        estimate_working_set_bytes=lambda size: (
+            _estimate_case_working_set_bytes(variant, dtype, size)
+        ),
+        estimate_work=lambda size: _estimate_case_work(variant, size),
+        describe_size=lambda size: _describe_case_size(size, variant, dtype),
+    )
+    return sizes, tuple(resolutions or ())
 
 
 def _initialize_case(array_module, variant, size, dtype):
@@ -184,26 +191,30 @@ def run_benchmarks(suite, size_request, *, variant="all", precision="64"):
     timer = suite.timer
     runs = suite.runs
     warmup = suite.warmup
-    sizes, resolutions = resolve_suite_size(
-        size_request,
-        resolve_from_target=lambda target_bytes: (
-            _resolve_size_from_memory_target(variant, precision, target_bytes)
-        ),
-        estimate_working_set_bytes=lambda resolved_size: (
-            _estimate_working_set_bytes(variant, precision, resolved_size)
-        ),
-        describe_size=lambda resolved_size: _describe_size(
-            resolved_size, variant, precision
-        ),
-    )
-    if resolutions is not None:
-        suite.print_size_resolution(resolutions)
-
-    dtypes = _get_dtypes(precision)
     variants = _get_variants(variant)
-    suite.run_timed(
-        solve, np, variants, sizes, runs, warmup, dtypes, timer=timer
-    )
+    dtypes = _get_dtypes(precision)
+    calls = []
+    resolutions = []
+
+    for case in variants:
+        for dtype in dtypes:
+            sizes, case_resolutions = _resolve_case_sizes(
+                size_request, case, dtype
+            )
+            resolutions.extend(case_resolutions)
+            calls.extend(
+                MicrobenchmarkCall(
+                    case_id=f"solve.{case}.{dtype}",
+                    name="solve",
+                    function=solve,
+                    args=(np, case, size, runs, warmup, dtype),
+                )
+                for size in sizes
+            )
+
+    if resolutions:
+        suite.print_size_resolution(resolutions)
+    suite.run_timed_calls(calls, timer=timer)
 
 
 class SolveSuite(MicrobenchmarkSuite):

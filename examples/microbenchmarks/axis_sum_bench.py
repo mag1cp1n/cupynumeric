@@ -33,10 +33,10 @@ from typing import Any
 import numpy as host_np
 
 from _benchmark import (
+    MicrobenchmarkCall,
     MicrobenchmarkSuite,
     benchmark_info,
     format_dtype,
-    get_benchmark_info,
     timed_loop,
 )
 from _benchmark.sizing import (
@@ -184,6 +184,16 @@ def _estimate_working_set_bytes(case: str, size: int) -> int:
     )
 
 
+def _estimate_case_work(case_name: str, size: int) -> int:
+    return math.prod(_input_shape(_CASES[case_name], size))
+
+
+def _estimate_work(case: str, size: int) -> int:
+    return max(
+        _estimate_case_work(case_name, size) for case_name in _get_cases(case)
+    )
+
+
 def _resolve_size_from_memory_target(case: str, target_bytes: int) -> int:
     return resolve_size_by_binary_search(
         target_bytes,
@@ -303,7 +313,6 @@ def run_benchmarks(suite, size_request, *, case="all", perform_check=False):
     timer = suite.timer
     runs = suite.runs
     warmup = suite.warmup
-    info = get_benchmark_info(axis_sum)
     sizes, resolutions = resolve_suite_size(
         size_request,
         resolve_from_target=lambda target_bytes: (
@@ -312,6 +321,9 @@ def run_benchmarks(suite, size_request, *, case="all", perform_check=False):
         estimate_working_set_bytes=lambda resolved_size: (
             _estimate_working_set_bytes(case, resolved_size)
         ),
+        estimate_work=lambda resolved_size: _estimate_work(
+            case, resolved_size
+        ),
         describe_size=lambda resolved_size: _describe_size(
             resolved_size, case
         ),
@@ -319,27 +331,26 @@ def run_benchmarks(suite, size_request, *, case="all", perform_check=False):
     if resolutions is not None:
         suite.print_size_resolution(resolutions)
 
+    calls = []
     for case_name in _get_cases(case):
-
-        def arg_gen():
-            for size in sizes:
-                alloc_shape = _base_shape(_CASES[case_name], size)
-                yield (
-                    np,
-                    *_case_args(case_name, size),
-                    size,
-                    runs,
-                    warmup,
-                    alloc_shape,
+        for size in sizes:
+            alloc_shape = _base_shape(_CASES[case_name], size)
+            calls.append(
+                MicrobenchmarkCall(
+                    case_id=f"axis_sum.{case_name}",
+                    name=case_name,
+                    function=axis_sum,
+                    args=(
+                        np,
+                        *_case_args(case_name, size),
+                        size,
+                        runs,
+                        warmup,
+                        alloc_shape,
+                    ),
                 )
-
-        suite.run_timed_with_generator(
-            info.replace(name=case_name),
-            axis_sum,
-            arg_gen(),
-            timer=timer,
-            perform_check=perform_check,
-        )
+            )
+    suite.run_timed_calls(calls, timer=timer, perform_check=perform_check)
 
 
 class AxisSumSuite(MicrobenchmarkSuite):
