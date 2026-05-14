@@ -56,7 +56,7 @@ from __future__ import annotations
 import math
 
 from _benchmark import MicrobenchmarkSuite, timed_loop
-from _benchmark.sizing import SizeRequest, clamp, resolve_linear_suite_size
+from _benchmark.sizing import SizeRequest, resolve_linear_suite_size
 
 
 # =============================================================================
@@ -66,21 +66,26 @@ from _benchmark.sizing import SizeRequest, clamp, resolve_linear_suite_size
 
 # Per-test peak bytes per resolved element (float64 = 8 bytes):
 #
-#   _BPE_8  — tests that allocate only the source array; index/output arrays
-#             are bounded by num_indices (≤1000 elements) and are negligible:
-#             take_2d, row_select_2d, array_get_col_2d
+#   _BPE_9        — putmask_scalar: source array (×8) + bool mask (×1);
+#                   write is in-place so no output allocation.
 #
-#   _BPE_9  — putmask_scalar: source array (×8) + bool mask (×1); write is
-#             in-place so no output allocation.
+#   _BPE_24       — boolean_get_1d / boolean_get_2d: AdvancedIndexingTask
+#                   allocates three same-size float64 buffers per GPU shard
+#                   — source (×8), intermediate int64 index array (×8), and
+#                   output (×8) — giving 24 B/el.  Confirmed from a crash
+#                   where the task requested 41,236,358,160 bytes
+#                   = 3 × 8 × (resolved_size / 32 GPUs).
 #
-#   _BPE_24 — boolean_get_1d / boolean_get_2d: AdvancedIndexingTask allocates
-#             three same-size float64 buffers per GPU shard — source (×8),
-#             intermediate int64 index array (×8), and output (×8) — giving
-#             24 B/el.  Confirmed from a crash where the task requested
-#             41,236,358,160 bytes = 3 × 8 × (resolved_size / 32 GPUs).
-_BPE_8 = 8
+#   _BPE_TAKE     — TakeTask broadcasts the *full* source array on every
+#                   GPU along the indexed axis (`broadcast(src, axis)`).
+#                   Per-GPU peak ≈ source_partitioned (×8/P) + broadcast
+#                   replica (×8) → ≈ ×16 globally for multi-GPU.  Used for
+#                   take-pattern benchmarks (take_2d, row_select_2d,
+#                   array_get_col_2d).  Without this they OOM on H100
+#                   (70 GB FB) at the larger `--memory-size` targets.
 _BPE_9 = 9
 _BPE_24 = 24
+_BPE_TAKE = 16
 
 
 def _describe_size_1d(size: int) -> list[str]:
@@ -189,9 +194,6 @@ def run_benchmarks(suite, size_request):
 
     # Resolve problem sizes independently per test group so that --memory-size
     # accurately bounds peak allocation for every test.
-    sizes_8, _ = resolve_linear_suite_size(
-        size_request, bytes_per_element=_BPE_8
-    )
     sizes_9, resolutions_9 = resolve_linear_suite_size(
         size_request, bytes_per_element=_BPE_9, describe_size=_describe_size_1d
     )
@@ -204,6 +206,9 @@ def run_benchmarks(suite, size_request):
             f"{max(1, math.isqrt(s))}",
         ],
     )
+    sizes_take, _ = resolve_linear_suite_size(
+        size_request, bytes_per_element=_BPE_TAKE
+    )
     if resolutions_9 is not None:
         suite.print_size_resolution(resolutions_9)
     if resolutions_24 is not None:
@@ -212,29 +217,34 @@ def run_benchmarks(suite, size_request):
     # n values for 2D boolean tests.
     ns_24 = [max(1, math.isqrt(size)) for size in sizes_24]
 
-    def arg_gen_2d_8():
-        # Tests whose output is bounded by num_indices (≤1000), so only `a` counts.
-        for size in sizes_8:
+    def arg_gen_2d_take():
+        # take_2d / row_select_2d / array_get_col_2d: per-GPU broadcast of the
+        # full source roughly doubles peak vs. partitioned source alone, so
+        # size is resolved against `_BPE_TAKE`.  num_indices = n // 10 scales
+        # with n so per-GPU work grows with --memory-size (weak scaling).
+        for size in sizes_take:
             n = max(1, math.isqrt(size))
-            num_indices = clamp(n // 10, 1, 1000)
+            num_indices = max(1, n // 10)
             yield (np, n, num_indices, runs, warmup)
 
     # putmask: a[bool_mask] = scalar  — 9 B/el (a + bool mask, in-place write)
     suite.run_timed(putmask_scalar, np, sizes_9, runs, warmup, timer=timer)
 
-    # TAKE task path: a[indices, :] (2D row GET)  — 8 B/el (output is ≤1000 rows)
-    suite.run_timed_with_generator(None, take_2d, arg_gen_2d_8(), timer=timer)
+    # TAKE task path: a[indices, :] (2D row GET)  — 16 B/el (broadcast)
+    suite.run_timed_with_generator(
+        None, take_2d, arg_gen_2d_take(), timer=timer
+    )
 
     # boolean GET: AdvancedIndexingTask uses 3 same-size buffers  — 24 B/el
     suite.run_timed(boolean_get_1d, np, sizes_24, runs, warmup, timer=timer)
     suite.run_timed(boolean_get_2d, np, ns_24, runs, warmup, timer=timer)
 
-    # TAKE task integer GET  — 8 B/el (output is ≤1000 rows/cols)
+    # TAKE task integer GET  — 16 B/el (broadcast)
     suite.run_timed_with_generator(
-        None, row_select_2d, arg_gen_2d_8(), timer=timer
+        None, row_select_2d, arg_gen_2d_take(), timer=timer
     )
     suite.run_timed_with_generator(
-        None, array_get_col_2d, arg_gen_2d_8(), timer=timer
+        None, array_get_col_2d, arg_gen_2d_take(), timer=timer
     )
 
 

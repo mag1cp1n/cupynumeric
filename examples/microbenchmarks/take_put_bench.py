@@ -59,12 +59,20 @@ from _benchmark.sizing import SizeRequest, resolve_linear_suite_size
 # = n²×12.8 bytes, with num_indices = n // 10.
 _PUT_BPE = 13
 
-# TAKE tests use TakeTask, which maps the *full* source array as a single instance
-# on one GPU (no distribution across GPUs).  The source must fit in one GPU's
-# framebuffer.  With fbmem ≈ 150 GB: max source = 150 GB → max size = 18.75B
-# elements.  BPE = 20 keeps size × 8 ≤ ~110 GB for targets up to 256 GiB,
-# leaving ~30% headroom.
-_TAKE_BPE = 20
+# TAKE tests use TakeTask, which broadcasts the *full* source array on every
+# GPU along the indexed axis (`broadcast(src, axis)`).  Per-GPU peak ≈
+# source_partitioned (×8/P) + broadcast replica (×8) → ≈ ×16 globally for
+# multi-GPU, plus indices/output overhead.  The source must fit in one GPU's
+# framebuffer for the broadcast to be legal.
+#
+# Tuned for H100 (~70 GB FB) with ~30% headroom: max per-GPU peak ≤ 50 GB →
+# max V (elements globally) ≤ 6.25 × 10⁹.  BPE = 44 keeps `V × 8` ≤ 50 GB up
+# to the 256-GiB target, and scales sub-linearly above that (8 GPU runs sweep
+# to 1 TiB, which would resolve to V ≈ 24 × 10⁹ → per-GPU peak ≈ 190 GB; the
+# broadcast there is genuinely impossible on H100 and either needs an impl
+# fix or a smaller sweep).  The previous BPE of 20 was calibrated for ~150 GB
+# FB and OOMs on H100.
+_TAKE_BPE = 44
 
 
 def _describe_size(size: int) -> list[str]:

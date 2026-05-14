@@ -227,6 +227,7 @@ def _make_recording_suite(
         run_timed_with_info=run_timed_with_info,
         run_timed_with_generator=run_timed_with_generator,
         run_timed_calls=run_timed_calls,
+        _config=SimpleNamespace(package="numpy"),
     )
 
 
