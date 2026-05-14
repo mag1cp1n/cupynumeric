@@ -21,7 +21,7 @@ on:
       python-version:
         required: false
         type: string
-        default: "3.12"
+        default: "3.14"
       refname:
         required: true
         type: string

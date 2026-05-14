@@ -32,7 +32,7 @@ jobs:
         build-has-tests:
           - true
         python-version:
-          - "3.13"
+          - "3.14"
         exclude:
           - platform: linux-aarch64
             target-device: gpu

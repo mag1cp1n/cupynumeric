@@ -39,6 +39,7 @@ jobs:
           - "3.11"
           - "3.12"
           - "3.13"
+          - "3.14"
     uses:
       ./.github/workflows/gh-build-and-test.yml
     with:
@@ -68,6 +69,7 @@ jobs:
           - "3.11"
           - "3.12"
           - "3.13"
+          - "3.14"
     uses:
       ./.github/workflows/gh-build-and-test.yml
     with:
@@ -97,6 +99,7 @@ jobs:
           - "3.11"
           - "3.12"
           - "3.13"
+          - "3.14"
     uses:
       ./.github/workflows/gh-build-and-test.yml
     with:
@@ -126,6 +129,7 @@ jobs:
           - "3.11"
           - "3.12"
           - "3.13"
+          - "3.14"
     uses:
       ./.github/workflows/gh-build-and-test.yml
     with:
