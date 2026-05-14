@@ -32,25 +32,12 @@ struct ZipGatherComputeIndexCuda {
   }
 };
 
-// Copy `elem_size` bytes from `src` to `dst` using a single typed load+store
-// for the power-of-2 widths covering every NumPy scalar dtype.
-__device__ __forceinline__ void copy_typed(char* dst, const char* src, size_t elem_size)
-{
-  switch (elem_size) {
-    case 1: *reinterpret_cast<uint8_t*>(dst) = *reinterpret_cast<const uint8_t*>(src); break;
-    case 2: *reinterpret_cast<uint16_t*>(dst) = *reinterpret_cast<const uint16_t*>(src); break;
-    case 4: *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(src); break;
-    case 8: *reinterpret_cast<uint64_t*>(dst) = *reinterpret_cast<const uint64_t*>(src); break;
-    case 16: *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src); break;
-    default: memcpy(dst, src, elem_size); break;
-  }
-}
-
 // Type-erased dense kernel: output is contiguous, indices are loaded via raw
 // int64_t pointers, and the source is copied with a width-specialized typed
-// load/store (see `copy_typed`). Dropping the element type from the template
-// (mirroring ``gather.cu``) cuts per-``T`` instantiations from nvcc and keeps
-// the kernel correct for any ``elem_size``.
+// load/store (see `copy_elements` in ``cuda_help.h``). Dropping the element
+// type from the template (mirroring ``gather.cu``) cuts per-``T``
+// instantiations from nvcc and keeps the kernel correct for any
+// ``elem_size``.
 template <int DIM, int N>
 __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
   zipgather_kernel_dense(char* out_bytes,
@@ -85,7 +72,8 @@ __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
                                start_index,
                                shape,
                                ZipGatherComputeIndexCuda{});
-  copy_typed(out_bytes + idx * elem_size, src_bytes + new_point.dot(src_byte_strides), elem_size);
+  copy_elements(
+    out_bytes + idx * elem_size, src_bytes + new_point.dot(src_byte_strides), elem_size);
 }
 
 // Typed general (non-dense) kernel. Uses Legate accessors for both output and

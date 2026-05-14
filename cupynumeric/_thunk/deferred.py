@@ -1209,6 +1209,113 @@ class DeferredArray:
         )
         return result
 
+    def _issue_zipscatter_task(
+        self,
+        result: LogicalStore,
+        source: LogicalStore,
+        start_index: int,
+        arrays: tuple[Any, ...],
+        key_dim: int,
+        out_shape: NdShape,
+        check_bounds: bool,
+    ) -> None:
+        """
+        Task-based fused zip + scatter for single-GPU advanced-indexing set.
+        Semantics: result[zip(arrays)[p]] = source[p] for all p in the source
+        domain.  The trailing ``add_input(result)`` mirrors ``_issue_scatter_task``
+        so Legate preserves cells that this scatter does not overwrite.
+        """
+        assert runtime.num_procs == 1, (
+            "CuPyNumeric zipscatter task only supported on single-process; "
+            "use the zip + scatter path otherwise"
+        )
+        assert source.shape == out_shape, (
+            f"source shape {source.shape} != zipscatter shape {out_shape}"
+        )
+
+        task = legate_runtime.create_auto_task(
+            self.library, CuPyNumericOpCode.ZIPSCATTER
+        )
+        if check_bounds:
+            task.throws_exception(IndexError)
+
+        task.add_output(result)
+        task.add_input(source)
+        task.add_scalar_arg(key_dim, ty.int64)
+        task.add_scalar_arg(start_index, ty.int64)
+        task.add_scalar_arg(self.shape, (ty.int64,))
+        task.add_scalar_arg(check_bounds, ty.bool_)
+        task.add_broadcast(result)
+        task.add_broadcast(source)
+        for a in arrays:
+            task.add_input(a)
+            task.add_broadcast(a)
+        # Re-add the result as the trailing input so Legate keeps cells we
+        # don't overwrite (the C++ side skips this trailing entry when it
+        # collects the per-dim index arrays).
+        task.add_input(result)
+        task.execute()
+
+    def _zipscatter(
+        self,
+        value: DeferredArray,
+        start_index: int,
+        arrays: tuple[Any, ...],
+        new_self: DeferredArray,
+        check_bounds: bool,
+    ) -> bool:
+        """
+        Try the fused zip + scatter fast path for advanced-indexing set.
+
+        Inputs are the outputs of ``_prepare_advanced_indexing_inputs``:
+        ``self`` is the (possibly copied) right-hand side, ``new_self`` is
+        the transformed destination view so we can stream updates back if
+        the prep had to materialize a copy.
+
+        Returns ``True`` when the scatter ran in place; ``False`` lets the
+        caller fall back to ``_zip_indices`` + ``_perform_scatter`` using
+        the same prepared inputs.
+        """
+        if runtime.num_procs != 1 or self.base.ndim == 0:
+            return False
+
+        start_index, arrays, key_dim, out_shape = self._prepare_zip_indices(
+            start_index, arrays
+        )
+        if out_shape == ():
+            return False
+
+        if value.shape != out_shape:
+            value_store = value._broadcast(out_shape)
+        else:
+            value_store = value.base
+
+        if value_store.has_scalar_storage:
+            value_tmp = DeferredArray(base=value_store)
+            value_store = value_tmp._convert_future_to_regionfield().base
+
+        lhs: DeferredArray = self
+        if lhs.base.has_scalar_storage:
+            lhs = lhs._convert_future_to_regionfield()
+
+        lhs._issue_zipscatter_task(
+            lhs.base,
+            value_store,
+            start_index,
+            arrays,
+            key_dim,
+            out_shape,
+            check_bounds,
+        )
+
+        # if `_prepare_advanced_indexing_inputs` had to materialize `self`
+        # into a temporary copy, copy the updated result back into the
+        # transformed destination view.
+        if lhs is not new_self:
+            new_self.copy(lhs, deep=True)
+
+        return True
+
     def _perform_gather(
         self,
         result: LogicalStore,
@@ -1254,7 +1361,6 @@ class DeferredArray:
             "CuPyNumeric scatter task only supported on single-GPU, "
             "use legate_runtime.issue_scatter() instead"
         )
-
         task = legate_runtime.create_auto_task(
             self.library, CuPyNumericOpCode.SCATTER
         )
@@ -1448,12 +1554,11 @@ class DeferredArray:
         Callers must have already ruled out the single-boolean-array and
         ``np.take`` shortcuts.  Parses the key (ellipsis unpacking,
         transpose, project/promote/slice), extracts the integer index
-        arrays, and returns the (possibly copied) right-hand side
-        ``rhs`` together with the raw index arrays.  The same outputs
-        feed both ``rhs._zip_indices(...)`` (which produces the final
-        indexing array for a separate gather) and
-        ``rhs._zipgather(...)`` (which fuses the zip + gather into a
-        single single-GPU kernel).
+        arrays, and returns the (possibly copied) right-hand side ``rhs``
+        together with the raw index arrays.  The same outputs feed the
+        fused single-GPU paths (``rhs._zipgather`` / ``rhs._zipscatter``)
+        and the partitioned fallback (``rhs._zip_indices`` followed by
+        gather/scatter).
         """
         store = self.base
         rhs = self
@@ -1558,39 +1663,6 @@ class DeferredArray:
             raise ValueError("Advanced indexing dimension mismatch")
 
         return rhs, start_index, tuple_of_arrays, self
-
-    def _create_indexing_array(
-        self, key: Any, is_set: bool = False, set_value: Any | None = None
-    ) -> tuple[bool, DeferredArray, DeferredArray, DeferredArray]:
-        # Try to handle single boolean array indexing first
-        if is_set:
-            boolean_result = self._try_single_boolean_array_index_set(
-                key, set_value
-            )
-        else:
-            boolean_result = self._try_single_boolean_array_index_get(key)
-
-        if boolean_result is not None:
-            return boolean_result
-
-        # Shortcut: a[indices, :, :] / a[:, indices] → np.take.  Only valid
-        # for get-item; ndim > 1 keeps the 1-D gather (a[indices]) on the
-        # _issue_gather_task path below.
-        if not is_set and self.ndim > 1:
-            take_result = self._try_advanced_indexing_using_take(key)
-            if take_result is not None:
-                return take_result
-
-        # General advanced-indexing case: prepare raw index arrays then zip.
-        rhs, start_index, tuple_of_arrays, new_self = (
-            self._prepare_advanced_indexing_inputs(key, is_set, set_value)
-        )
-        output_arr = rhs._zip_indices(
-            start_index,
-            tuple_of_arrays,
-            check_bounds=settings.bounds_check_enabled("indexing"),
-        )
-        return True, rhs, output_arr, new_self
 
     @staticmethod
     def _unpack_ellipsis(key: tuple[Any, ...], ndim: int) -> tuple[Any, ...]:
@@ -1750,10 +1822,74 @@ class DeferredArray:
             # copy if a self-copy might overlap
             value = value._copy_if_overlapping(self)
 
-            # Create the indexing array
-            (copy_needed, lhs, index_array, self) = (
-                self._create_indexing_array(key, True, value)
+            # Prefer fused zipscatter on single-GPU; bool + scalar value
+            # is routed through the bool shortcut → putmask instead.
+            zipscatter_eligible = (
+                runtime.num_procs == 1
+                and self.base.ndim > 0
+                and not (
+                    isinstance(key, DeferredArray)
+                    and key.dtype == bool
+                    and value.size == 1
+                )
             )
+
+            if zipscatter_eligible:
+                # Lift 0-D to 1-D for the prep only, so it returns the
+                # transformed view rather than a copy.  The fallback below
+                # keeps the original 0-D value, which broadcasts cleanly
+                # against an empty index_array.shape.
+                prep_value = (
+                    DeferredArray(base=value.base.promote(0, 1))
+                    if value.base.ndim == 0
+                    else value
+                )
+
+                rhs, start_index, tuple_of_arrays, self = (
+                    self._prepare_advanced_indexing_inputs(
+                        key, is_set=True, set_value=prep_value
+                    )
+                )
+                check_bounds = settings.bounds_check_enabled("indexing")
+
+                if rhs._zipscatter(
+                    prep_value,
+                    start_index,
+                    tuple_of_arrays,
+                    self,
+                    check_bounds,
+                ):
+                    return
+
+                # zipscatter declined.  Reuse the prepared inputs to
+                # build the index array for the fallback.
+                index_array = rhs._zip_indices(
+                    start_index, tuple_of_arrays, check_bounds=check_bounds
+                )
+                lhs = rhs
+                copy_needed = True
+            else:
+                # Multi-GPU or bool+scalar: try the bool single-array
+                # shortcut (putmask or bool-task → scatter); otherwise
+                # prep + zip_indices for general advanced indexing.
+                boolean_result = self._try_single_boolean_array_index_set(
+                    key, value
+                )
+                if boolean_result is not None:
+                    copy_needed, lhs, index_array, self = boolean_result
+                else:
+                    rhs, start_index, tuple_of_arrays, self = (
+                        self._prepare_advanced_indexing_inputs(
+                            key, is_set=True, set_value=value
+                        )
+                    )
+                    index_array = rhs._zip_indices(
+                        start_index,
+                        tuple_of_arrays,
+                        check_bounds=settings.bounds_check_enabled("indexing"),
+                    )
+                    lhs = rhs
+                    copy_needed = True
 
             if not copy_needed:
                 return

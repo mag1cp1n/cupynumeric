@@ -137,6 +137,7 @@ target_sources(cupynumeric PRIVATE
   src/cupynumeric/index/choose.cc
   src/cupynumeric/index/gather.cc
   src/cupynumeric/index/zipgather.cc
+  src/cupynumeric/index/zipscatter.cc
   src/cupynumeric/index/scatter.cc
   src/cupynumeric/index/pad.cc
   src/cupynumeric/index/putmask.cc
@@ -215,6 +216,7 @@ if(Legion_USE_OpenMP)
     src/cupynumeric/index/choose_omp.cc
     src/cupynumeric/index/gather_omp.cc
     src/cupynumeric/index/zipgather_omp.cc
+    src/cupynumeric/index/zipscatter_omp.cc
     src/cupynumeric/index/scatter_omp.cc
     src/cupynumeric/index/pad_omp.cc
     src/cupynumeric/index/putmask_omp.cc
@@ -278,6 +280,7 @@ if(Legion_USE_CUDA)
     src/cupynumeric/index/choose.cu
     src/cupynumeric/index/gather.cu
     src/cupynumeric/index/zipgather.cu
+    src/cupynumeric/index/zipscatter.cu
     src/cupynumeric/index/scatter.cu
     src/cupynumeric/index/pad.cu
     src/cupynumeric/index/putmask.cu

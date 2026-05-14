@@ -40,6 +40,29 @@ static void nonzeros(size_t volume,
                      Point<DIM> origin,
                      cudaStream_t stream)
 {
+  if constexpr (DIM == 1) {
+    // 1-D fast path: the coordinate equals the linear flat index + origin[0],
+    // so we can iterate over coordinates directly and let `copy_if` write
+    // them into the output buffer without a separate unflatten/scatter step.
+    const int64_t lo = origin[0];
+    const int64_t hi = lo + static_cast<int64_t>(volume);
+
+    auto count_nz =
+      thrust::count_if(DEFAULT_POLICY.on(stream),
+                       thrust::make_counting_iterator<int64_t>(lo),
+                       thrust::make_counting_iterator<int64_t>(hi),
+                       [in] __device__(int64_t coord) { return (in[Point<1>(coord)] != VAL{0}); });
+
+    auto buf = outputs[0].create_output_buffer<int64_t, 1>(Point<1>(count_nz), true);
+
+    thrust::copy_if(DEFAULT_POLICY.on(stream),
+                    thrust::make_counting_iterator<int64_t>(lo),
+                    thrust::make_counting_iterator<int64_t>(hi),
+                    buf.ptr(0),
+                    [in] __device__(int64_t coord) { return (in[Point<1>(coord)] != VAL{0}); });
+    return;
+  }
+
   // step 1:
   // count nonzeros:
   //

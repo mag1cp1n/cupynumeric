@@ -168,6 +168,7 @@ def test_CuPyNumericOpCode() -> None:
         "WRITE",
         "ZIP",
         "ZIPGATHER",
+        "ZIPSCATTER",
     }
 
 

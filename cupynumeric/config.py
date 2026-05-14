@@ -301,6 +301,7 @@ class _CupynumericSharedLib:
     CUPYNUMERIC_WRITE: int
     CUPYNUMERIC_ZIP: int
     CUPYNUMERIC_ZIPGATHER: int
+    CUPYNUMERIC_ZIPSCATTER: int
 
     @abstractmethod
     def cupynumeric_has_cusolvermp(self) -> bool: ...
@@ -455,6 +456,7 @@ class CuPyNumericOpCode(IntEnum):
     WRITE = _cupynumeric.CUPYNUMERIC_WRITE
     ZIP = _cupynumeric.CUPYNUMERIC_ZIP
     ZIPGATHER = _cupynumeric.CUPYNUMERIC_ZIPGATHER
+    ZIPSCATTER = _cupynumeric.CUPYNUMERIC_ZIPSCATTER
 
 
 # Match these to CuPyNumericUnaryOpCode in cupynumeric_c.h

@@ -231,6 +231,24 @@ __device__ inline size_t global_tid_1d()
   return static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 }
 
+// Type-erased copy of `elem_size` bytes from `src` to `dst` using a single
+// typed load+store for the power-of-2 widths covering every NumPy scalar
+// dtype (1/2/4/8/16 bytes).  Any other width falls back to byte-wise
+// `memcpy`.  Intended for type-erased dense kernels (e.g. zipgather /
+// zipscatter) that want to avoid generating one specialisation per element
+// type while still emitting wide loads/stores for the common sizes.
+__device__ __forceinline__ void copy_elements(char* dst, const char* src, size_t elem_size)
+{
+  switch (elem_size) {
+    case 1: *reinterpret_cast<uint8_t*>(dst) = *reinterpret_cast<const uint8_t*>(src); break;
+    case 2: *reinterpret_cast<uint16_t*>(dst) = *reinterpret_cast<const uint16_t*>(src); break;
+    case 4: *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(src); break;
+    case 8: *reinterpret_cast<uint64_t*>(dst) = *reinterpret_cast<const uint64_t*>(src); break;
+    case 16: *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src); break;
+    default: memcpy(dst, src, elem_size); break;
+  }
+}
+
 struct cufftPlan {
   cufftHandle handle;
   size_t workarea_size;

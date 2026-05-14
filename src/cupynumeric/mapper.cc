@@ -701,6 +701,18 @@ std::optional<std::size_t> CuPyNumericMapper::allocation_pool_size(
       }
       return 0;
     }
+    case CUPYNUMERIC_ZIPSCATTER: {
+      // Mirrors CUPYNUMERIC_ZIPGATHER but the result is re-added as the last
+      // input for dependency tracking, so index_arrays = num_inputs() - 2.
+      const auto num_index_arrays = task.num_inputs() - 2;
+      if (memory_kind == legate::mapping::StoreTarget::FBMEM) {
+        return aligned_size(num_index_arrays * sizeof(ACC_TYPE), DEFAULT_ALIGNMENT);
+      }
+      if (memory_kind == legate::mapping::StoreTarget::ZCMEM) {
+        return aligned_size(num_index_arrays * sizeof(const int64_t*), DEFAULT_ALIGNMENT);
+      }
+      return 0;
+    }
     case CUPYNUMERIC_IN1D: {
       if (memory_kind == legate::mapping::StoreTarget::ZCMEM) {
         return 0;
